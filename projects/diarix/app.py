@@ -1,4 +1,4 @@
-"""
+""" python
 Media Editor — Flask app
 Load media (upload or URL) -> preview & cut chunks with ffmpeg -> transcribe
 (openai-whisper / faster-whisper / whispermlx) with optional speaker
@@ -73,6 +73,7 @@ def get_session(sid, create=False):
             "segments": [],
             "source_files": [],   # list of loaded files (multi-file support)
             "multifile": False,   # True only for multi-disk uploads
+            "transcriptions": [], # list of per-file transcriptions (multi-file mode)
         }
         SESSIONS[sid] = sess
     return sess
@@ -88,6 +89,7 @@ def wipe_session_dir(sess):
     sess["segments"] = []
     sess["source_files"] = []
     sess["multifile"] = False
+    sess["transcriptions"] = []
 
 
 def fmt_ts(t):
@@ -764,13 +766,77 @@ def api_transcribe():
     api_key = d.get("api_key")
     num_speakers = d.get("num_speakers")
 
+    # ---- multi-file path: one transcription per source file, NOT concatenated ----
     if sess.get("multifile"):
-        # each uploaded file is its own source; offset is 0
-        sources = [{"path": f["path"], "start": 0.0} for f in sess["source_files"]]
-    else:
-        sources = sess["chunks"] if sess["chunks"] else [{
-            "start": 0.0, "path": sess["source"]["path"],
-        }]
+        results = []
+        try:
+            for f in sess["source_files"]:
+                segs = transcribe_file(
+                    f["path"], engine, language, device, model_size,
+                    hf_token=api_key,
+                    diarize=(engine == "mlx" and diarize),
+                )
+                # ensure segment dicts are JSON-safe and have consistent keys
+                norm_segs = []
+                for s in segs:
+                    seg = {
+                        "start": float(s.get("start", 0.0)),
+                        "end": float(s.get("end", 0.0)),
+                        "text": (s.get("text") or "").strip(),
+                    }
+                    if s.get("speaker"):
+                        seg["speaker"] = s["speaker"]
+                    norm_segs.append(seg)
+
+                # diarization for non-MLX engines (per file)
+                if diarize and not any(s.get("speaker") for s in norm_segs):
+                    if diarize_method == "pyannote":
+                        turns = run_pyannote(f["path"], api_key, num_speakers)
+                        assign_speakers_from_turns(norm_segs, turns)
+                    elif diarize_method == "ai_api":
+                        labels = run_ai_diarization(norm_segs, ai_provider, api_key, num_speakers)
+                        for seg, label in zip(norm_segs, labels):
+                            seg["speaker"] = label
+                    else:
+                        return jsonify(error="Choose a diarization method (pyannote or AI API)."), 400
+
+                lines = []
+                for seg in norm_segs:
+                    prefix = f"{seg['speaker']}: " if seg.get("speaker") else ""
+                    lines.append(f"[{fmt_ts(seg['start'])} - {fmt_ts(seg['end'])}] {prefix}{seg['text']}")
+                text = "\n".join(lines)
+
+                results.append({
+                    "name": f["name"],
+                    "transcript": text,
+                    "segments": norm_segs,
+                })
+        except RuntimeError as e:
+            return jsonify(error=str(e)), 500
+        except Exception as e:
+            return jsonify(error=f"Transcription failed: {e}"), 500
+
+        sess["transcriptions"] = results
+        # For convenience: also keep a combined transcript for the ZIP export.
+        sess["transcript"] = "\n\n".join(
+            f"===== {r['name']} =====\n{r['transcript']}" for r in results
+        )
+        sess["segments"] = []  # no combined segments in multi-file mode
+
+        return jsonify(
+            multifile=True,
+            transcriptions=results,
+            # Provide an empty combined transcript so the single-textarea UI
+            # still works if someone falls back to it; but frontend will use
+            # `transcriptions` for multi-file.
+            transcript="",
+            segments=[],
+        )
+
+    # ---- single-file path (unchanged behavior) ----
+    sources = sess["chunks"] if sess["chunks"] else [{
+        "start": 0.0, "path": sess["source"]["path"],
+    }]
     sources = sorted(sources, key=lambda c: c.get("start", 0.0))
 
     all_segments = []
@@ -828,6 +894,7 @@ def api_transcribe():
     transcript = "\n".join(lines)
     sess["transcript"] = transcript
     sess["segments"] = all_segments
+    sess["transcriptions"] = []
     return jsonify(transcript=transcript, segments=all_segments)
 
 
@@ -874,6 +941,24 @@ def download_transcription():
     return send_file(buf, as_attachment=True, download_name="transcription.txt", mimetype="text/plain")
 
 
+@app.route("/api/download/transcription/<int:idx>")
+def download_transcription_indexed(idx):
+    """Download a single per-file transcription (multi-file mode)."""
+    sid = get_sid_or_none()
+    sess = get_session(sid) if sid else None
+    if not sess:
+        abort(404)
+    transcriptions = sess.get("transcriptions") or []
+    if idx < 0 or idx >= len(transcriptions):
+        abort(404)
+    item = transcriptions[idx]
+    base = os.path.splitext(item.get("name", f"transcription_{idx}"))[0] or f"transcription_{idx}"
+    fname = f"{base}.txt"
+    buf = io.BytesIO(item["transcript"].encode("utf-8"))
+    buf.seek(0)
+    return send_file(buf, as_attachment=True, download_name=fname, mimetype="text/plain")
+
+
 @app.route("/api/download/zip")
 def download_zip():
     sid = get_sid_or_none()
@@ -882,7 +967,12 @@ def download_zip():
         abort(404)
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        if sess.get("transcript"):
+        if sess.get("transcriptions"):
+            # multi-file mode: one txt per source file
+            for i, item in enumerate(sess["transcriptions"]):
+                base = os.path.splitext(item.get("name", f"transcription_{i}"))[0] or f"transcription_{i}"
+                z.writestr(f"transcriptions/{base}.txt", item["transcript"])
+        elif sess.get("transcript"):
             z.writestr("transcription.txt", sess["transcript"])
         if sess["chunks"]:
             for c in sess["chunks"]:
@@ -981,7 +1071,7 @@ main{flex:1 1 auto; min-height:0; display:flex; padding:16px 22px 22px;}
 .row{display:flex; gap:14px; flex-wrap:wrap;}
 .row > .field{flex:1; min-width:150px;}
 
-select, input[type=text], input[type=url], input[type=number], textarea{
+select, input[type=text], input[type=url], input[type=number], input[type=password], textarea{
   background:var(--panel-2); border:1px solid var(--border); color:var(--text);
   border-radius:7px; padding:9px 11px; font-family:var(--font-body); font-size:13.5px;
   outline:none; transition:border-color .15s;
@@ -1120,6 +1210,23 @@ ul#chunkList li .idx{color:var(--amber); font-weight:600;}
 /* --- extract tab --- */
 textarea#transcriptOut{flex:1; min-height:220px; resize:vertical; font-family:var(--font-mono); font-size:12.5px; line-height:1.6;}
 .download-row{display:flex; gap:10px; flex-wrap:wrap;}
+
+/* --- multi-file transcription results --- */
+.multi-results{display:flex; flex-direction:column; gap:16px;}
+.multi-result-item{
+  display:flex; flex-direction:column; gap:8px;
+  background:var(--panel-2); border:1px solid var(--border); border-radius:9px; padding:12px 14px;
+}
+.multi-result-item .mr-header{
+  display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap;
+}
+.multi-result-item .mr-name{
+  font-family:var(--font-display); font-weight:600; font-size:13.5px; color:var(--amber);
+  word-break:break-all;
+}
+.multi-result-item textarea{
+  min-height:160px; resize:vertical; font-family:var(--font-mono); font-size:12.5px; line-height:1.6;
+}
 
 .toast{
   position:fixed; bottom:18px; left:50%; transform:translateX(-50%) translateY(10px);
@@ -1311,19 +1418,30 @@ footer{flex:0 0 auto; padding:9px 22px; text-align:center; font-size:11px; color
 
       <!-- TAB 4: extract results -->
       <div class="tab-panel" data-panel="extract" style="flex:1;">
-        <textarea id="transcriptOut" placeholder="Your transcription will appear here." readonly></textarea>
-        <div class="download-row">
-          <button class="btn secondary" id="downloadTxtBtn">Download transcription</button>
-          <button class="btn secondary" id="downloadZipBtn">Download zip file</button>
+        <!-- Single-file mode UI -->
+        <div id="singleResultWrap" style="display:flex; flex-direction:column; gap:18px; flex:1;">
+          <textarea id="transcriptOut" placeholder="Your transcription will appear here." readonly></textarea>
+          <div class="download-row">
+            <button class="btn secondary" id="downloadTxtBtn">Download transcription</button>
+            <button class="btn secondary" id="downloadZipBtn">Download zip file</button>
+          </div>
+          <div id="speakerRenamePanel" class="hidden" style="margin-top: 10px;">
+            <fieldset>
+              <legend>Rename speakers</legend>
+              <div id="speakerRenameList"></div>
+              <div style="margin-top: 10px;">
+                <button class="btn" id="applySpeakerNamesBtn">Apply names</button>
+              </div>
+            </fieldset>
+          </div>
         </div>
-        <div id="speakerRenamePanel" class="hidden" style="margin-top: 10px;">
-          <fieldset>
-            <legend>Rename speakers</legend>
-            <div id="speakerRenameList"></div>
-            <div style="margin-top: 10px;">
-              <button class="btn" id="applySpeakerNamesBtn">Apply names</button>
-            </div>
-          </fieldset>
+
+        <!-- Multi-file mode UI: one textarea + download button per file -->
+        <div id="multiResultWrap" class="hidden" style="display:flex; flex-direction:column; gap:18px; flex:1;">
+          <div class="download-row">
+            <button class="btn secondary" id="downloadZipBtnMulti">Download zip file</button>
+          </div>
+          <div id="multiResultList" class="multi-results"></div>
         </div>
       </div>
 
@@ -1341,7 +1459,8 @@ footer{flex:0 0 auto; padding:9px 22px; text-align:center; font-size:11px; color
 const state = {
   kind:null, duration:0, chunks:[], segments:[],
   selectedFormat:null, youtubeFormats:[],
-  multifile:false, fileCount:0, files:[]
+  multifile:false, fileCount:0, files:[],
+  transcriptions:[],
 };
 
 // ---------- utils ----------
@@ -1594,12 +1713,14 @@ document.getElementById('loadBtn').addEventListener('click', async ()=>{
     state.multifile = !!data.multifile;
     state.fileCount = data.file_count || 1;
     state.files = data.files || [];
+    state.transcriptions = [];
 
     setupPreviewElement(data.kind, data.src);
     resetCutUI();
     renderChunkList();
     displayMediaInfo(data);
     applyMultifileMode(state.multifile);
+    clearResultsUI();
     unlockTabs();
     if (state.multifile) {
       goTab('transcribe');
@@ -1825,15 +1946,87 @@ document.getElementById('transcribeBtn').addEventListener('click', async ()=>{
     const data = await api('/api/transcribe', {
       method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload),
     });
-    state.segments = data.segments;
-    document.getElementById('transcriptOut').value = data.transcript;
-    setupSpeakerRenamePanel(data.segments);
+
+    if (data.multifile) {
+      state.transcriptions = data.transcriptions || [];
+      renderMultiTranscriptions(state.transcriptions);
+    } else {
+      state.transcriptions = [];
+      state.segments = data.segments;
+      document.getElementById('transcriptOut').value = data.transcript;
+      setupSpeakerRenamePanel(data.segments);
+      showSingleResults();
+    }
     goTab('extract');
   }catch(e){ toast(e.message); }
   finally{ btn.disabled = false; btn.textContent = 'Transcribe'; }
 });
 
 // ---------- tab 4: results ----------
+const singleResultWrap = document.getElementById('singleResultWrap');
+const multiResultWrap = document.getElementById('multiResultWrap');
+const multiResultList = document.getElementById('multiResultList');
+
+function showSingleResults(){
+  singleResultWrap.classList.remove('hidden');
+  multiResultWrap.classList.add('hidden');
+  multiResultList.innerHTML = '';
+}
+function showMultiResults(){
+  singleResultWrap.classList.add('hidden');
+  multiResultWrap.classList.remove('hidden');
+}
+function clearResultsUI(){
+  document.getElementById('transcriptOut').value = '';
+  document.getElementById('speakerRenamePanel').classList.add('hidden');
+  multiResultList.innerHTML = '';
+  state.transcriptions = [];
+  showSingleResults();
+}
+
+function renderMultiTranscriptions(items){
+  multiResultList.innerHTML = '';
+  if (!items || items.length === 0){
+    multiResultList.innerHTML = '<div class="empty-note">No transcriptions returned.</div>';
+    showMultiResults();
+    return;
+  }
+
+  items.forEach((item, idx)=>{
+    const wrap = document.createElement('div');
+    wrap.className = 'multi-result-item';
+
+    const header = document.createElement('div');
+    header.className = 'mr-header';
+
+    const nameEl = document.createElement('div');
+    nameEl.className = 'mr-name';
+    nameEl.textContent = item.name || `File ${idx+1}`;
+
+    const dlBtn = document.createElement('button');
+    dlBtn.className = 'btn secondary small';
+    dlBtn.textContent = 'Download';
+    dlBtn.title = 'Download this transcription';
+    dlBtn.addEventListener('click', ()=>{
+      window.location.href = `/api/download/transcription/${idx}`;
+    });
+
+    header.appendChild(nameEl);
+    header.appendChild(dlBtn);
+
+    const ta = document.createElement('textarea');
+    ta.readOnly = true;
+    ta.value = item.transcript || '';
+    ta.spellcheck = false;
+
+    wrap.appendChild(header);
+    wrap.appendChild(ta);
+    multiResultList.appendChild(wrap);
+  });
+
+  showMultiResults();
+}
+
 function setupSpeakerRenamePanel(segments){
   const panel = document.getElementById('speakerRenamePanel');
   const list = document.getElementById('speakerRenameList');
@@ -1841,7 +2034,7 @@ function setupSpeakerRenamePanel(segments){
   list.innerHTML = '';
 
   const speakers = new Set();
-  segments.forEach(seg => {
+  (segments || []).forEach(seg => {
     if (seg.speaker) {
       speakers.add(seg.speaker);
     }
@@ -1910,6 +2103,9 @@ document.getElementById('downloadTxtBtn').addEventListener('click', ()=>{
   window.location.href = '/api/download/transcription';
 });
 document.getElementById('downloadZipBtn').addEventListener('click', ()=>{
+  window.location.href = '/api/download/zip';
+});
+document.getElementById('downloadZipBtnMulti').addEventListener('click', ()=>{
   window.location.href = '/api/download/zip';
 });
 </script>
