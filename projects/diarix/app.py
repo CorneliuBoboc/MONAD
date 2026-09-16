@@ -366,8 +366,10 @@ def run_ai_diarization(segments, provider, api_key, num_speakers=None):
 
     prompt = (
         "You are labeling speaker turns in a transcript based only on the text and timing below "
-        "(no audio). " + constraint + " Respond with ONLY a JSON array of strings, one label per "
-        "segment, in the same order as the input, and nothing else.\n\n"
+        "(no audio). " + constraint + " Respond with ONLY a JSON array of objects. Return exactly "
+        "one object for every input segment; do not merge, omit, duplicate, or reorder segments. "
+        "Each object must have the input index 'i' and a 'label', for example "
+        "[{\"i\": 0, \"label\": \"SPEAKER_00\"}].\n\n"
         f"Segments: {json.dumps(payload)}"
     )
 
@@ -385,20 +387,74 @@ def run_ai_diarization(segments, provider, api_key, num_speakers=None):
         text = "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
     elif provider == "gemini":
         try:
-            import google.generativeai as genai
+            from google import genai
+            from google.genai import types
         except ImportError:
-            raise RuntimeError("The 'google-generativeai' package is not installed on the server (pip install google-generativeai).")
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-3.1-flash-lite")
-        text = model.generate_content(prompt).text
+            raise RuntimeError("The 'google-genai' package is not installed on the server (pip install google-genai).")
+        client = genai.Client(api_key=api_key)
+        text = ""
+        finish_reason = None
+        for attempt in range(2):
+            request_prompt = prompt
+            if attempt:
+                request_prompt += (
+                    "\n\nYour previous response was incomplete or invalid. Return the complete "
+                    "JSON array again, including every input index from 0 through "
+                    f"{len(segments) - 1}."
+                )
+            response = client.models.generate_content(
+                model="gemini-3.1-flash-lite",
+                contents=request_prompt,
+                config=types.GenerateContentConfig(
+                    max_output_tokens=8000,
+                    response_mime_type="application/json",
+                ),
+            )
+            text = response.text or ""
+            candidates = getattr(response, "candidates", None) or []
+            finish_reason = getattr(candidates[0], "finish_reason", None) if candidates else None
+            data = None
+            try:
+                match = re.search(r"\[.*\]", text, re.DOTALL)
+                data = json.loads(match.group(0)) if match else None
+                labels = [item["label"] for item in data]
+                indices = [item["i"] for item in data]
+                if (
+                    len(labels) == len(segments)
+                    and indices == list(range(len(segments)))
+                    and all(isinstance(label, str) and label for label in labels)
+                ):
+                    return labels
+            except (TypeError, KeyError, IndexError, json.JSONDecodeError):
+                pass
+            app.logger.warning(
+                "Gemini diarization response incomplete: attempt=%d segments=%d "
+                "labels=%d finish_reason=%s",
+                attempt + 1,
+                len(segments),
+                len(data) if isinstance(data, list) else 0,
+                finish_reason,
+            )
+        raise RuntimeError("The AI diarization response did not label every segment.")
     else:
         raise RuntimeError(f"Unknown AI provider '{provider}'.")
 
     match = re.search(r"\[.*\]", text, re.DOTALL)
     if not match:
         raise RuntimeError("The AI diarization response could not be parsed as JSON.")
-    labels = json.loads(match.group(0))
-    if len(labels) != len(segments):
+    data = json.loads(match.group(0))
+    if not isinstance(data, list):
+        raise RuntimeError("The AI diarization response was not a JSON array.")
+    try:
+        labels = [item["label"] for item in data]
+        indices = [item["i"] for item in data]
+    except (TypeError, KeyError):
+        raise RuntimeError("The AI diarization response had an invalid label format.")
+    if (
+        len(labels) != len(segments)
+        or indices != list(range(len(segments)))
+        or not all(isinstance(label, str) and label for label in labels)
+    ):
         raise RuntimeError("The AI diarization response did not label every segment.")
     return labels
 
@@ -883,8 +939,10 @@ def api_transcribe():
                 return jsonify(error="Choose a diarization method (pyannote or AI API)."), 400
 
         except RuntimeError as e:
+            app.logger.exception("Diarization failed")
             return jsonify(error=str(e)), 500
         except Exception as e:
+            app.logger.exception("Diarization failed")
             return jsonify(error=f"Diarization failed: {e}"), 500
 
     lines = []
