@@ -19,6 +19,8 @@ body:
 pdfutils is a self-contained Flask app that provides utilities for processing PDF documents.
 It can split PDF files by chapters (using Gemini API) or by pages/pageranges.
 Aditional utilities may be added in the future.
+It loads one or more PDF files.
+User selects split by pageranges or by chapters, then triggers the splitting.
 
 ## Remarks
 
