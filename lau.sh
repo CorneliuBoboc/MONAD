@@ -56,6 +56,8 @@ direct_pip() {
 }
 
 launch_apps() {
+  pip uninstall -y google-genai google-generativeai google-auth google-auth-oauthlib
+  pip install -U google-genai google-auth
   SCRIPT="test.sh"
   for APP in $APPS; do
     test -n "$APP"
