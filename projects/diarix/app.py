@@ -385,12 +385,17 @@ def run_ai_diarization(segments, provider, api_key, num_speakers=None):
         text = "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
     elif provider == "gemini":
         try:
-            import google.generativeai as genai
+            from google import genai
+            from google.genai import types
         except ImportError:
-            raise RuntimeError("The 'google-generativeai' package is not installed on the server (pip install google-generativeai).")
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-3.1-flash-lite")
-        text = model.generate_content(prompt).text
+            raise RuntimeError("The 'google-genai' package is not installed on the server (pip install google-genai).")
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model="gemini-3.1-flash-lite",
+            contents=prompt,
+            config=types.GenerateContentConfig(max_output_tokens=2000),
+        )
+        text = response.text or ""
     else:
         raise RuntimeError(f"Unknown AI provider '{provider}'.")
 

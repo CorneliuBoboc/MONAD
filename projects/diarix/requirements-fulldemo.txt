@@ -5,5 +5,5 @@ faster-whisper
 openai-whisper>=20231117   # optional: remove if you do not need transcription
 yt-dlp                   # optional: install separately if YouTube download is needed
 # ffmpeg must be installed at the OS level (not via pip)
-#google-generativeai
+google-genai==2.23.0
 pyannote.audio
