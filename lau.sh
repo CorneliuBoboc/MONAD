@@ -59,8 +59,6 @@ launch_apps() {
   SCRIPT="test.sh"
   for APP in $APPS; do
     test -n "$APP"
-  pip uninstall -y google-genai google-generativeai google-auth google-auth-oauthlib
-  pip install -U google-genai google-auth
     bash "$SCRIPT" "$APP" && echo "Launched $APP ok"
   done
 }
