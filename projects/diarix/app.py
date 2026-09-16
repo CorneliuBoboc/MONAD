@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import tempfile
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 from uuid import uuid4
 
@@ -312,6 +313,17 @@ def transcribe_file(path, engine, language, device, model_size, hf_token=None, d
         # MLX CLI takes an explicit "auto" string (handled inside the runner).
         return run_mlx_whisper_cli(path, lang, model_size, hf_token, diarize)
     raise RuntimeError(f"Unknown transcription engine '{engine}'.")
+
+
+def get_mlx_worker_count():
+    raw = os.environ.get("DIARIX_MLX_WORKERS", "1")
+    try:
+        workers = int(raw)
+    except ValueError:
+        raise RuntimeError("DIARIX_MLX_WORKERS must be an integer from 1 to 4.")
+    if not 1 <= workers <= 4:
+        raise RuntimeError("DIARIX_MLX_WORKERS must be an integer from 1 to 4.")
+    return workers
 
 
 # --------------------------------------------------------------------------
@@ -825,13 +837,39 @@ def api_transcribe():
     # ---- multi-file path: one transcription per source file, NOT concatenated ----
     if sess.get("multifile"):
         results = []
+        errors = []
         try:
-            for f in sess["source_files"]:
-                segs = transcribe_file(
-                    f["path"], engine, language, device, model_size,
-                    hf_token=api_key,
-                    diarize=(engine == "mlx" and diarize),
-                )
+            if engine == "mlx":
+                workers = get_mlx_worker_count()
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    futures = [
+                        executor.submit(
+                            transcribe_file,
+                            f["path"], engine, language, device, model_size,
+                            api_key, diarize,
+                        )
+                        for f in sess["source_files"]
+                    ]
+                    transcriptions = []
+                    for f, future in zip(sess["source_files"], futures):
+                        try:
+                            transcriptions.append((f, future.result()))
+                        except Exception as e:
+                            errors.append({"name": f["name"], "error": str(e)})
+            else:
+                transcriptions = [
+                    (
+                        f,
+                        transcribe_file(
+                            f["path"], engine, language, device, model_size,
+                            hf_token=api_key,
+                            diarize=False,
+                        ),
+                    )
+                    for f in sess["source_files"]
+                ]
+
+            for f, segs in transcriptions:
                 # ensure segment dicts are JSON-safe and have consistent keys
                 norm_segs = []
                 for s in segs:
@@ -882,6 +920,7 @@ def api_transcribe():
         return jsonify(
             multifile=True,
             transcriptions=results,
+            errors=errors,
             # Provide an empty combined transcript so the single-textarea UI
             # still works if someone falls back to it; but frontend will use
             # `transcriptions` for multi-file.
