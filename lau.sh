@@ -80,5 +80,5 @@ else
 fi
 
 echo "All apps have been launched"
-echo "See them on ports 5030, 5034 and 5005"
+echo "See them on ports 5030, 5034, 5009 and 5005"
 echo "Done."
