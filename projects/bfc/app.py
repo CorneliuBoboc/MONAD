@@ -94,7 +94,7 @@ TARGET_FORMATS = {"pdf", "docx", "epub", "md", "html", "txt"}
 
 DEFAULT_MODELS = {
     "claude": "claude-sonnet-5",
-    "gemini": "gemini-3.1-flash-lite",
+    "gemini": "gemini-3.5-flash-lite",
 }
 ENV_KEYS = {
     "claude": "ANTHROPIC_API_KEY",
