@@ -888,8 +888,10 @@ def api_transcribe():
                 return jsonify(error="Choose a diarization method (pyannote or AI API)."), 400
 
         except RuntimeError as e:
+            app.logger.exception("Diarization failed")
             return jsonify(error=str(e)), 500
         except Exception as e:
+            app.logger.exception("Diarization failed")
             return jsonify(error=f"Diarization failed: {e}"), 500
 
     lines = []
