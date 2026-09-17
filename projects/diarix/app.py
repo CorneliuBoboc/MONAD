@@ -415,7 +415,7 @@ def run_ai_diarization(segments, provider, api_key, num_speakers=None):
                     f"{len(segments) - 1}."
                 )
             response = client.models.generate_content(
-                model="gemini-3.1-flash-lite",
+                model="gemini-3.5-flash-lite",
                 contents=request_prompt,
                 config=types.GenerateContentConfig(
                     max_output_tokens=8000,

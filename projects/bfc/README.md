@@ -55,7 +55,7 @@ For the two AI-powered operations, you can either:
 
 Model names drift over time — the UI has an optional "Model" override field
 per provider; leave it blank to use the app's built-in default
-(`claude-sonnet-5` / `gemini-2.5-flash`), or set it explicitly if those
+(`claude-sonnet-5` / `gemini-3.5-flash`), or set it explicitly if those
 become outdated.
 
 ## Conversion fidelity — please read
