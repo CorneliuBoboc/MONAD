@@ -1633,7 +1633,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
     <!-- TAB 1: DOCUMENT -->
     <section class="tab-panel active" id="tab-document">
       <h3 class="panel-title">Upload document(s)</h3>
-      <p class="hint">Supports PDF, DOCX, EPUB, Markdown, HTML and TXT &mdash; up to 60&nbsp;MB. You can drop several files at once for batch conversion.</p>
+      <p class="hint">Supports PDF, DOCX, EPUB, Markdown, HTML and TXT &mdash; up to 60&nbsp;MB per upload. Add files from several folders; the pool stays open until you choose an operation.</p>
       <div class="dropzone" id="dropzone" tabindex="0" role="button" aria-label="Upload files">
         <div class="big">Drop files here, or click to choose one or more</div>
         <div class="small">.pdf &nbsp;.docx &nbsp;.epub &nbsp;.md &nbsp;.html &nbsp;.txt</div>
@@ -1645,7 +1645,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
           <div class="meta" id="fileMeta"></div>
           <div class="file-list" id="fileList"></div>
         </div>
-        <button class="btn secondary" id="changeFileBtn" type="button">Change files</button>
+        <button class="btn secondary" id="changeFileBtn" type="button">Clear file pool</button>
       </div>
       <div class="status" id="uploadStatus"></div>
       <div class="actions">
@@ -1872,13 +1872,15 @@ PAGE_HTML = r"""<!DOCTYPE html>
       .then(function(r){ return r.json().then(function(j){ return {ok:r.ok, body:j}; }); })
       .then(function(res){
         if (!res.ok) { setStatus(statusEl, res.body.error || 'Upload failed.', 'err'); return; }
-        state.files = res.body.files || [];
-        if (!state.files.length) {
+        var uploaded = res.body.files || [];
+        if (!uploaded.length && !state.files.length) {
           setStatus(statusEl, 'No usable files uploaded.', 'err');
           return;
         }
-        dropzone.style.display = 'none';
-        $('#fileCard').style.display = 'flex';
+        // Each picker/drop operation is an addition to the session's pool.
+        // Keep the dropzone open so files can be gathered from other folders.
+        state.files = state.files.concat(uploaded);
+        $('#fileCard').style.display = state.files.length ? 'flex' : 'none';
         renderFileCard();
         var errs = res.body.errors || [];
         if (errs.length) {
@@ -1887,7 +1889,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
             errs.map(function(e){ return e.filename + ' (' + e.error + ')'; }).join('; '),
             'err');
         } else {
-          setStatus(statusEl, '', '');
+          setStatus(statusEl, state.files.length + ' file(s) ready. Add more or choose an operation.', 'ok');
         }
         $('#toOperationBtn').disabled = false;
         unlockTab('operation');
