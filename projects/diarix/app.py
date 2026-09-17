@@ -496,7 +496,6 @@ def media_source(sid):
 def api_load():
     sid = ensure_sid()
     sess = get_session(sid, create=True)
-    wipe_session_dir(sess)
 
     up_list = request.files.getlist("files") or []
     single = request.files.get("file")
@@ -507,14 +506,15 @@ def api_load():
     url = (request.form.get("url") or "").strip()
 
     if up_list:
-        # ---- multi-file upload path ----
+        # ---- additive disk-upload path ----
         files_dir = os.path.join(sess["dir"], "sources")
         os.makedirs(files_dir, exist_ok=True)
 
         loaded = []
-        for i, up in enumerate(up_list):
+        start_index = len(sess["source_files"])
+        for i, up in enumerate(up_list, start=start_index):
             ext = os.path.splitext(secure_filename(up.filename))[1].lower() or ".mp4"
-            src_path = os.path.join(files_dir, f"{i:04d}_source{ext}")
+            src_path = os.path.join(files_dir, f"{i:04d}_{uuid4().hex}_source{ext}")
             up.save(src_path)
 
             info = probe_media(src_path)
@@ -538,12 +538,12 @@ def api_load():
             })
 
         if not loaded:
-            return jsonify(error="None of the uploaded files could be read as media."), 400
+            return jsonify(error="None of the newly uploaded files could be read as media."), 400
 
-        sess["source_files"] = loaded
-        sess["multifile"] = len(loaded) > 1
+        sess["source_files"].extend(loaded)
+        sess["multifile"] = len(sess["source_files"]) > 1
 
-        first = loaded[0]
+        first = sess["source_files"][0]
         sess["source"] = {
             "path": first["path"],
             "ext": first["ext"],
@@ -564,7 +564,7 @@ def api_load():
             video_info=first["video_info"],
             audio_info=first["audio_info"],
             multifile=sess["multifile"],
-            file_count=len(loaded),
+            file_count=len(sess["source_files"]),
             files=[
                 {
                     "name": f["name"],
@@ -572,12 +572,13 @@ def api_load():
                     "duration": f["duration"],
                     "file_size": f["file_size"],
                 }
-                for f in loaded
+                for f in sess["source_files"]
             ],
         )
 
     if url:
         # ---- URL path: always single-file, multifile=False ----
+        wipe_session_dir(sess)
         is_youtube = any(domain in url.lower() for domain in ['youtube.com', 'youtu.be'])
         src_path = None
 
@@ -1376,7 +1377,7 @@ footer{flex:0 0 auto; padding:9px 22px; text-align:center; font-size:11px; color
           </div>
         </div>
         <div class="field" id="uploadField">
-          <label for="fileInput">Media file(s) — select one for cut/transcribe, or several for batch transcription</label>
+          <label for="fileInput">Media file(s) — add one or more files at a time; the upload pool stays open for more files</label>
           <input type="file" id="fileInput" accept="video/*,audio/*" multiple>
         </div>
         <div class="field hidden" id="urlField">
@@ -1393,7 +1394,7 @@ footer{flex:0 0 auto; padding:9px 22px; text-align:center; font-size:11px; color
           </div>
         </div>
 
-        <div><button class="btn" id="loadBtn">Load file</button></div>
+        <div><button class="btn" id="loadBtn">Add files</button></div>
 
         <!-- Media info panel -->
         <div id="mediaInfoPanel" class="media-info-panel hidden">
@@ -1630,7 +1631,7 @@ modeUpload.addEventListener('click', ()=>{
   modeUpload.classList.add('active'); modeUrl.classList.remove('active');
   uploadField.classList.remove('hidden'); urlField.classList.add('hidden');
   youtubeFormatField.classList.add('hidden');
-  document.getElementById('loadBtn').textContent = 'Load file';
+  document.getElementById('loadBtn').textContent = 'Add files';
 });
 modeUrl.addEventListener('click', ()=>{
   modeUrl.classList.add('active'); modeUpload.classList.remove('active');
@@ -1825,7 +1826,7 @@ document.getElementById('loadBtn').addEventListener('click', async ()=>{
       goTab('cut');
     }
   }catch(e){ toast(e.message); }
-  finally{ btn.disabled = false; btn.textContent = modeUpload.classList.contains('active') ? 'Load file' : 'Load from URL'; }
+  finally{ btn.disabled = false; btn.textContent = modeUpload.classList.contains('active') ? 'Add files' : 'Load from URL'; }
 });
 
 function applyMultifileMode(isMulti){
