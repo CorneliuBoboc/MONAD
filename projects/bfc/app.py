@@ -71,6 +71,13 @@ except ImportError:
     BeautifulSoup = None
 
 try:
+    from google import genai
+    from google.genai import types
+except ImportError:
+    genai = None
+    types = None
+
+try:
     from reportlab.lib.pagesizes import LETTER
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -94,7 +101,7 @@ TARGET_FORMATS = {"pdf", "docx", "epub", "md", "html", "txt"}
 
 DEFAULT_MODELS = {
     "claude": "claude-sonnet-5",
-    "gemini": "gemini-3.1-flash-lite",
+    "gemini": "gemini-3.5-flash-lite",
 }
 ENV_KEYS = {
     "claude": "ANTHROPIC_API_KEY",
@@ -138,6 +145,14 @@ def safe_stem(filename):
 def sanitize_title(title):
     t = secure_filename((title or "").strip().replace(" ", "_"))[:60]
     return t or f"part_{uuid.uuid4().hex[:6]}"
+
+
+def sanitize_pdf_split_filename(name, fallback_title="section"):
+    value = (name or "").strip()
+    value = re.sub(r"[^\w\-. ]+", "", value, flags=re.UNICODE)
+    value = re.sub(r"\s+", "_", value)
+    value = value.strip("._-") or (fallback_title or "section")
+    return value[:80]
 
 
 _manifest_locks = {}
@@ -668,8 +683,11 @@ def group_blocks_into_sections(blocks):
 def _split_pdf(src_path, ranges, out_dir):
     if fitz is not None:
         src = fitz.open(src_path)
+        total = len(src)
         outs = []
         for a, b in ranges:
+            a = max(0, min(int(a), total - 1)) if total else 0
+            b = max(a, min(int(b), total - 1)) if total else 0
             nd = fitz.open()
             nd.insert_pdf(src, from_page=a, to_page=b)
             p = os.path.join(out_dir, f"tmp_{uuid.uuid4().hex}.pdf")
@@ -680,8 +698,11 @@ def _split_pdf(src_path, ranges, out_dir):
         return outs
     if PdfReader is not None and PdfWriter is not None:
         reader = PdfReader(src_path)
+        total = len(reader.pages)
         outs = []
         for a, b in ranges:
+            a = max(0, min(int(a), total - 1)) if total else 0
+            b = max(a, min(int(b), total - 1)) if total else 0
             writer = PdfWriter()
             for i in range(a, b + 1):
                 writer.add_page(reader.pages[i])
@@ -763,8 +784,33 @@ def split_document(src_path, ext, ranges, target_ext, out_dir):
 # ---- AI helpers -----------------------------------------------------------
 
 SPLIT_SYSTEM_PROMPT = (
-    "You are a precise document-structure analyst. You respond with strict JSON "
-    "only \u2014 no prose, no markdown code fences, no explanations."
+"""You are analyzing a PDF document. Identify every top-level section that should become its own standalone PDF.
+
+CRITICAL: Do NOT group all front matter into one section, and do NOT group all back matter into one. Each distinct front-matter or back-matter item must be its OWN section with its OWN filename. Examples of separate front-matter sections: cover, copyright page, dedication, table of contents, foreword, preface, acknowledgements. Examples of separate back-matter sections: appendix A, appendix B, glossary, bibliography, index, colophon, about the author.
+
+For proper chapters, use the chapter NUMBER shown in the document (not a running index).
+
+Return STRICT JSON, no prose, matching this schema:
+{
+  "sections": [
+    {
+      "title": "Human readable title as it appears in the document",
+      "number": 7,              // printed chapter number if any, else null
+      "kind": "frontmatter" | "chapter" | "backmatter",
+      "start_page": 12,         // 1-based, inclusive
+      "end_page": 34,           // 1-based, inclusive
+      "filename": "07_The_Chapter_Title"   // no extension; safe chars; zero-pad number to 2 digits when present
+    }
+  ]
+}
+
+Rules:
+- Sections must be contiguous and cover the document in order.
+- Every distinct front/back-matter item is its own section (e.g. "00_cover", "00_copyright", "00_toc", "00_foreword", "99_glossary", "99_index").
+- Front/back matter use number=null and filename prefixed with "00_" (front) or "99_" (back).
+- Filenames: ASCII letters/digits/underscore only, <=80 chars, no extension.
+- Do not invent content not present in the PDF.
+"""
 )
 TOC_SYSTEM_PROMPT = (
     "You are an expert technical editor who writes exceptionally detailed, "
@@ -837,6 +883,37 @@ def call_ai(provider, key, model, system, prompt, max_tokens=4000):
     raise ValueError("Unknown AI provider.")
 
 
+def call_gemini_pdf_sections(api_key, filename, pdf_bytes):
+    if genai is None or types is None:
+        raise RuntimeError("google-genai is required for PDF chapter detection. Install it with: pip install google-genai")
+
+    client = genai.Client(api_key=api_key)
+    uploaded = client.files.upload(
+        file=io.BytesIO(pdf_bytes),
+        config=types.UploadFileConfig(mime_type="application/pdf", display_name=filename),
+    )
+    try:
+        resp = client.models.generate_content(
+            model=DEFAULT_MODELS["gemini"],
+            contents=[
+                types.Part.from_uri(file_uri=uploaded.uri, mime_type="application/pdf"),
+                SPLIT_SYSTEM_PROMPT,
+            ],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.1,
+            ),
+        )
+        text = resp.text or ""
+        text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
+        return text
+    finally:
+        try:
+            client.files.delete(name=uploaded.name)
+        except Exception:
+            pass
+
+
 def truncate_text(s, n):
     if len(s) <= n:
         return s, False
@@ -879,16 +956,59 @@ def build_outline_units(blocks, ext):
     return lines, len(blocks), "block"
 
 
-def build_split_prompt(outline_text, unit_kind, total_units):
+def build_split_prompt(outline_text, unit_kind, total_units, ext=None):
+    if ext == "pdf":
+        return (
+            "You are analyzing a PDF document. Identify every top-level section that should become its own standalone PDF.\n\n"
+            "CRITICAL: Do NOT group all front matter into one section, and do NOT group all back matter into one. Each distinct front-matter or back-matter item must be its OWN section with its OWN filename. Examples of separate front-matter sections: cover, copyright page, dedication, table of contents, foreword, preface, acknowledgements. Examples of separate back-matter sections: appendix A, appendix B, glossary, bibliography, index, colophon, about the author.\n\n"
+            "For proper chapters, use the chapter NUMBER shown in the document (not a running index).\n\n"
+            "Return STRICT JSON, no prose, matching this schema:\n"
+            '{\n  "sections": [\n    {\n      "title": "Human readable title as it appears in the document",\n      "number": 7,\n      "kind": "frontmatter" | "chapter" | "backmatter",\n      "start_page": 12,\n      "end_page": 34,\n      "filename": "07_The_Chapter_Title"\n    }\n  ]\n}\n\n'
+            "Rules:\n"
+            "- Sections must be contiguous and cover the document in order.\n"
+            "- Every distinct front/back-matter item is its own section.\n"
+            "- Front/back matter use number=null and filename prefixed with 00_ or 99_.\n"
+            "- Filenames: ASCII letters/digits/underscore only, <=80 chars, no extension.\n"
+            "- Do not invent content not present in the PDF.\n\n"
+            "Use the following document outline as context only. It is a compressed summary, not the full text.\n"
+            f"OUTLINE:\n{outline_text}"
+        )
+
     return (
         f"Below is an outline of a document broken into {total_units} {unit_kind}s, numbered from 0.\n"
-        "Identify natural chapter/section boundaries.\n"
+        "Identify natural section boundaries and return the start location of each section.\n"
         "Return ONLY valid JSON of this exact form: "
-        '{"chapters": [{"title": "string", "start_unit": integer}, ...]}\n'
+        '{"sections": [{"title": "string", "start_unit": integer}, ...]}\n'
         f"Rules: start_unit values must be strictly increasing integers between 0 and {total_units - 1}. "
-        "The first chapter must have start_unit = 0. Do not include any text outside the JSON.\n\n"
+        "The first section must have start_unit = 0. Do not include any text outside the JSON.\n\n"
         f"OUTLINE:\n{outline_text}"
     )
+
+
+def _coerce_start_unit(item, total_units):
+    for key in ("start_unit", "start", "start_index", "index"):
+        if key not in item:
+            continue
+        try:
+            value = int(item[key])
+        except (TypeError, ValueError):
+            continue
+        return max(0, min(value, total_units - 1))
+    return None
+
+
+def _coerce_start_page(item, total_units):
+    for key in ("start_page", "page_start", "start"):
+        if key not in item:
+            continue
+        try:
+            value = int(item[key])
+        except (TypeError, ValueError):
+            continue
+        if value <= 0:
+            return 0
+        return max(0, min(value - 1, total_units - 1))
+    return None
 
 
 def parse_split_response(raw, total_units):
@@ -901,39 +1021,64 @@ def parse_split_response(raw, total_units):
         if not m:
             raise RuntimeError("The AI response was not valid JSON.")
         data = json.loads(m.group(0))
-    chapters = data.get("chapters") if isinstance(data, dict) else None
-    if not isinstance(chapters, list) or not chapters:
-        raise RuntimeError("The AI response did not contain a usable chapters list.")
+    if not isinstance(data, dict):
+        raise RuntimeError("The AI response did not contain a usable section list.")
+
+    items = data.get("sections")
+    if items is None:
+        items = data.get("chapters")
+    if not isinstance(items, list) or not items:
+        raise RuntimeError("The AI response did not contain a usable section list.")
+
     cleaned = []
     seen = set()
-    for c in chapters:
-        if not isinstance(c, dict):
+    for item in items:
+        if not isinstance(item, dict):
             continue
-        try:
-            su = int(c.get("start_unit"))
-        except Exception:
+
+        start_page = _coerce_start_page(item, total_units)
+        start_unit = _coerce_start_unit(item, total_units)
+        start_value = start_page if start_page is not None else start_unit
+        if start_value is None:
             continue
-        su = max(0, min(su, total_units - 1))
-        if su in seen:
+        if start_value in seen:
             continue
-        seen.add(su)
-        title = str(c.get("title") or "").strip()[:120] or f"Part {len(cleaned) + 1}"
-        cleaned.append({"title": title, "start_unit": su})
+        seen.add(start_value)
+        title = str(item.get("title") or item.get("name") or item.get("filename") or "").strip()[:120]
+        filename = item.get("filename")
+        entry = {"title": title or f"Part {len(cleaned) + 1}", "start_unit": start_value}
+        if filename is not None and str(filename).strip():
+            entry["filename"] = sanitize_pdf_split_filename(str(filename), title or f"Part {len(cleaned) + 1}")
+        if "start_page" in item:
+            start_page = max(1, int(item.get("start_page", 1)))
+            end_page = max(start_page, int(item.get("end_page", start_page)))
+            entry["start_page"] = min(start_page, total_units)
+            entry["end_page"] = min(end_page, total_units)
+        cleaned.append(entry)
     cleaned.sort(key=lambda x: x["start_unit"])
     if not cleaned:
-        raise RuntimeError("The AI response did not contain any valid chapter boundaries.")
+        raise RuntimeError("The AI response did not contain any valid section boundaries.")
     if cleaned[0]["start_unit"] != 0:
         cleaned.insert(0, {"title": "Introduction", "start_unit": 0})
     return cleaned
 
 
 def chapters_to_ranges(chapters, total_units):
+    total_units = max(0, int(total_units or 0))
+    if total_units <= 0:
+        return []
+
     ranges = []
     for i, c in enumerate(chapters):
-        start = c["start_unit"]
+        if "start_page" in c and "end_page" in c:
+            start = max(0, min(int(c["start_page"]) - 1, total_units - 1))
+            end = max(start, min(int(c["end_page"]) - 1, total_units - 1))
+            ranges.append((start, end))
+            continue
+
+        start = max(0, min(int(c["start_unit"]), total_units - 1))
         end = (chapters[i + 1]["start_unit"] - 1) if i + 1 < len(chapters) else total_units - 1
-        if end < start:
-            end = start
+        end = max(start, min(end, total_units - 1))
         ranges.append((start, end))
     return ranges
 
@@ -1202,24 +1347,36 @@ def api_ai_split():
         )), 400
 
     try:
-        blocks = extract_blocks(rec["abs_path"], rec["ext"])
-        lines, total_units, unit_kind = build_outline_units(blocks, rec["ext"])
-        if total_units < 2:
-            return jsonify(error="Document is too short to split into chapters."), 400
-        outline_text, truncated = truncate_text("\n".join(lines), 15000)
-        prompt = build_split_prompt(outline_text, unit_kind, total_units)
-        raw = call_ai(provider, key, model or DEFAULT_MODELS[provider], SPLIT_SYSTEM_PROMPT, prompt)
-        chapters = parse_split_response(raw, total_units)
-        ranges = chapters_to_ranges(chapters, total_units)
-        if rec["ext"] in ("pdf", "epub"):
+        if rec["ext"] == "pdf" and provider == "gemini":
+            with open(rec["abs_path"], "rb") as fh:
+                pdf_bytes = fh.read()
+            raw = call_gemini_pdf_sections(key, rec["filename"], pdf_bytes)
+            chapters = parse_split_response(raw, rec["meta"].get("units") or 0)
+            total_units = rec["meta"].get("units") or 0
+            if total_units < 2:
+                return jsonify(error="Document is too short to split into chapters."), 400
+            ranges = chapters_to_ranges(chapters, total_units)
             tmp_paths = split_document(rec["abs_path"], rec["ext"], ranges, target_ext=target, out_dir=session_dir())
+            truncated = False
         else:
-            tmp_paths = []
-            for a, b in ranges:
-                sub = blocks[a:b + 1]
-                p = os.path.join(session_dir(), f"tmp_{uuid.uuid4().hex}.{target}")
-                render_blocks(sub, target, p)
-                tmp_paths.append(p)
+            blocks = extract_blocks(rec["abs_path"], rec["ext"])
+            lines, total_units, unit_kind = build_outline_units(blocks, rec["ext"])
+            if total_units < 2:
+                return jsonify(error="Document is too short to split into chapters."), 400
+            outline_text, truncated = truncate_text("\n".join(lines), 15000)
+            prompt = build_split_prompt(outline_text, unit_kind, total_units, rec["ext"])
+            raw = call_ai(provider, key, model or DEFAULT_MODELS[provider], SPLIT_SYSTEM_PROMPT, prompt)
+            chapters = parse_split_response(raw, total_units)
+            ranges = chapters_to_ranges(chapters, total_units)
+            if rec["ext"] in ("pdf", "epub"):
+                tmp_paths = split_document(rec["abs_path"], rec["ext"], ranges, target_ext=target, out_dir=session_dir())
+            else:
+                tmp_paths = []
+                for a, b in ranges:
+                    sub = blocks[a:b + 1]
+                    p = os.path.join(session_dir(), f"tmp_{uuid.uuid4().hex}.{target}")
+                    render_blocks(sub, target, p)
+                    tmp_paths.append(p)
     except RuntimeError as e:
         return jsonify(error=str(e)), 502
     except ValueError as e:
@@ -1235,7 +1392,11 @@ def api_ai_split():
         final_path = os.path.join(session_dir(), stored_name)
         shutil.move(p, final_path)
         title = chapters[i]["title"] if i < len(chapters) else f"Part {i + 1}"
-        fname = f"{sanitize_title(title)}.{target}"
+        chapter_name = chapters[i].get("filename") if i < len(chapters) else None
+        if chapter_name:
+            fname = f"{chapter_name}.{target}"
+        else:
+            fname = f"{sanitize_title(title)}.{target}"
         register_output(oid, fname, target, stored_name)
         results.append({"output_id": oid, "filename": fname, "title": title})
     return jsonify({"chapters": results, "truncated_outline": truncated})
@@ -1827,7 +1988,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
       keyWrap.style.display = enterKey.checked ? 'block' : 'none';
     });
     function updateModelPlaceholder(){
-      modelInput.placeholder = providerSel.value === 'claude' ? 'e.g. claude-sonnet-5' : 'e.g. gemini-3.1-flash-lite';
+      modelInput.placeholder = providerSel.value === 'claude' ? 'e.g. claude-sonnet-5' : 'e.g. gemini-3.5-flash-lite';
     }
     providerSel.addEventListener('change', updateModelPlaceholder);
     updateModelPlaceholder();

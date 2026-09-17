@@ -1,123 +1,144 @@
 # MONAD
 
-MONAD is a small collection of local tools and experiments, with a shell
-launcher for the Flask applications in `projects/`.
+  MONAD is a small local launcher + collection of self-contained Flask apps for
+  media work, document conversion, and video processing. Each app lives under
+  `projects/` and runs independently with its own Python requirements.
 
-## Included applications
+  ## Included apps
 
-| Application | Purpose | Port |
-| --- | --- | ---: |
-| `diarix` | Media upload, cutting, transcription, and optional speaker diarization | 5030 |
-| `bfc` | Media editing and document utilities, depending on the current app implementation | 5034 |
-| `vd` | Video download and media processing from uploads or URLs | 5005 |
+  | App | Purpose | Local port |
+  | --- | --- | ---: |
+  | `diarix` | Media upload, trimming, transcription, and optional diarization | 5030 |
+  | `bfc` | Document conversion and split utilities with optional AI chapter/TOC generation | 5034 |
+  | `pdfutils` | PDF utilities such as splitting and chapter detection | 5009 |
+  | `vd` | Video download and local media processing | 5005 |
 
-The root `index.html` provides links to the local applications. The
-application-specific documentation and specifications live in each project
-directory.
+  The root `index.html` exposes quick links to the local apps. Each app may have
+  its own README/spec in its project directory for detailed usage and
+  limitations.
 
-## Requirements
+  ## Requirements
 
-- Linux or macOS
-- Bash and, for `lau.sh`, Zsh-compatible shell utilities
-- Python 3.12 or 3.13
-- `pip`
-- `ffmpeg` and `ffprobe` for the media applications
-- `lsof` and `ping` for the launcher scripts
+  - Linux or macOS
+  - Bash and standard Unix utilities (`lsof`, `ping`)
+  - Python 3.12 or 3.13
+  - `pip`
+  - `ffmpeg` and `ffprobe` for the media-related apps
 
-Some applications also require large or platform-specific Python packages
-such as Whisper, `pyannote.audio`, PyMuPDF, and EbookLib. These are installed
-from the requirements file for each application.
+  Some apps also depend on large packages such as Whisper, `pyannote.audio`,
+  PyMuPDF, EbookLib, or `yt-dlp`. These are installed from each app's
+  `requirements.txt` when `test.sh` runs.
 
-## Quick start
+  ## Quick start
 
-From the repository root, create an environment and launch all applications:
+  From the repo root, launch everything:
 
-```bash
-./lau.sh
-```
+  ```bash
+  ./lau.sh
+  ```
 
-`lau.sh` creates or reuses a root `.venv`, installs the dependencies while
-running `test.sh`, stops processes already using the application ports, and
-launches each directory under `projects/`. It waits for network connectivity
-before starting. To recreate the environment from scratch:
+  This script:
 
-```bash
-./lau.sh --cold
-```
+  - discovers apps in `projects/`
+  - exports `DEMO` and `VER`
+  - stops any old processes already using the configured ports
+  - creates or reuses a root `.venv`
+  - runs `test.sh` for each app to install dependencies and verify startup
+  - waits for outbound connectivity before starting the stack
 
-The launcher expects the application dependencies to be available in:
+  To recreate the environment from scratch:
 
-```text
-projects/diarix/requirements.txt
-projects/bfc/requirements.txt
-projects/vd/requirements.txt
-```
+  ```bash
+  ./lau.sh --cold
+  ```
 
-Open `index.html` in a browser after the applications start, or visit:
+  To validate a single app manually:
 
-- <http://127.0.0.1:5030>
-- <http://127.0.0.1:5034>
-- <http://127.0.0.1:5005>
+  ```bash
+  bash ./test.sh diarix
+  bash ./test.sh bfc
+  bash ./test.sh vd
+  bash ./test.sh pdfutils
+  ```
 
-To start one application manually:
+  Open `index.html` in a browser, or visit these URLs once launched:
 
-```bash
-cd projects/diarix
-python3.13 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-python app.py
-```
+  - <http://127.0.0.1:5030> (`diarix`)
+  - <http://127.0.0.1:5034> (`bfc`)
+  - <http://127.0.0.1:5009> (`pdfutils`)
+  - <http://127.0.0.1:5005> (`vd`)
 
-Use the corresponding directory and requirements file for `bfc` or `vd`.
+  ## Manual app startup
 
-## Environment variables
+  Each project is self-contained. Example:
 
-The launcher exports:
+  ```bash
+  cd projects/diarix
+  python3.13 -m venv .venv
+  source .venv/bin/activate
+  pip install -r requirements.txt
+  python app.py
+  ```
 
-- `DEMO` — enabled automatically on Linux; used to select Linux-specific
-  dependency behavior.
-- `VER` — Python version used by the launcher (`3.13` on Linux, `3.12`
-  otherwise).
+  Use the corresponding directory and requirements file for `bfc`, `pdfutils`,
+  or `vd`.
 
-The applications may use provider credentials when their optional AI features
-are enabled. See the application source and README files for the exact
-environment variable names and supported providers.
+  ## Environment variables
 
-## Utility scripts
+  The launcher exports:
 
-- `pacbuild.sh` compiles `pac.c`, asks for confirmation, and installs the
-  resulting timestamp-prefixing utility as `/usr/local/bin/pac`.
-- `pac.c` copies standard input to standard output and prefixes each new line
-  with a nanosecond timestamp.
-- `instal` copies the repository's `zsh_aliases` file to `~/.zsh_aliases` and
-  adds a source line to `~/.zshrc` when needed.
-- `update.sh` removes `$HOME/MONAD`, clones
-  `https://github.com/CorneliuBoboc/MONAD.git`, and enters the fresh clone.
-- `test.sh <application>` installs that application's requirements and checks
-  that its Flask process starts.
+  - `DEMO` — enabled automatically on Linux; used to select Linux-specific
+    dependency behavior.
+  - `VER` — Python version used by the launcher (`3.13` on Linux, `3.12`
+    otherwise).
 
-Review scripts before running them: `lau.sh` terminates processes using the
-configured ports, `--cold` removes virtual environments and the local pip
-cache, and `update.sh` removes an existing `$HOME/MONAD` directory.
+  Apps may also rely on service credentials for optional AI features, for example:
 
-## Project layout
+  - `ANTHROPIC_API_KEY`
+  - `GEMINI_API_KEY`
+  - app-specific secret keys such as `DOCUTIL_SECRET_KEY` or `MEDIA_EDITOR_SECRET`
 
-```text
-.
-├── index.html          # Links to the local web applications
-├── lau.sh              # Main launcher
-├── test.sh             # Per-application dependency/startup check
-├── pac.c               # Timestamp-prefixing stdin utility
-├── pacbuild.sh         # Build/install script for pac
-└── projects/
-    ├── diarix/
-    ├── bfc/
-    └── vd/
-```
+  See each project README or source file for the exact variables supported by the
+  app.
 
-## Development notes
+  ## Utility scripts
 
-The applications are personal/local tools and are not configured as a
-production deployment. Do not expose them to an untrusted network without
-adding authentication, request limits, and an appropriate production server.
+  - `instal` copies `zsh_aliases` into `~/.zsh_aliases` and adds the source line
+    to `~/.zshrc` when needed.
+  - `update.sh` removes `$HOME/MONAD`, clones the upstream repo, and enters the
+    fresh copy.
+  - `pacbuild.sh` builds `pac.c` and installs it as `/usr/local/bin/pac`.
+  - `pac.c` timestamps each line it receives on stdin.
+  - `test.sh <app>` installs that app's requirements and verifies the Flask
+    process starts.
+
+  Review scripts before running them: `lau.sh` terminates old processes on the
+  configured ports, `--cold` clears venvs and pip caches, and `update.sh`
+  removes an existing `$HOME/MONAD` directory.
+
+  ## Project layout
+
+  ```text
+  .
+  ├── README.md           # Project overview
+  ├── index.html          # Links to local app URLs
+  ├── lau.sh              # Main launcher for the full stack
+  ├── test.sh             # App-specific dependency/startup check
+  ├── pac.c               # Timestamping utility source
+  ├── pacbuild.sh         # Build/install script for pac
+  ├── instal              # Shell setup helper
+  ├── update.sh           # Repo refresh helper
+  ├── zsh_aliases         # Local shell aliases
+  └── projects/
+      ├── diarix/
+      ├── bfc/
+      ├── pdfutils/
+      └── vd/
+  ```
+
+  ## Notes
+
+  These apps are intended as local/personal tools rather than production
+  services. They are not protected by authentication or deployment hardening by
+  default; do not expose them directly to an untrusted network without adding
+  those safeguards.

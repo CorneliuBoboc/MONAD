@@ -5,7 +5,7 @@ set -e
 APPS="$(ls projects)"
 ARG="$1"
 OS="$(uname)"
-PORTS="5030 5034 5005"
+PORTS="5030 5034 5009 5005"
 VER="3.12"
 
 DEMO=false
@@ -80,5 +80,5 @@ else
 fi
 
 echo "All apps have been launched"
-echo "See them on ports 5030, 5034 and 5005"
+echo "See them on ports 5030, 5034, 5009 and 5005"
 echo "Done."
