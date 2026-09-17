@@ -1988,7 +1988,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
       keyWrap.style.display = enterKey.checked ? 'block' : 'none';
     });
     function updateModelPlaceholder(){
-      modelInput.placeholder = providerSel.value === 'claude' ? 'e.g. claude-sonnet-5' : 'e.g. gemini-3.1-flash-lite';
+      modelInput.placeholder = providerSel.value === 'claude' ? 'e.g. claude-sonnet-5' : 'e.g. gemini-3.5-flash-lite';
     }
     providerSel.addEventListener('change', updateModelPlaceholder);
     updateModelPlaceholder();
