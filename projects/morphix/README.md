@@ -30,8 +30,9 @@ will return a clear error message telling you what to install.
 
 ## What it does
 
-1. **Upload** a PDF, DOCX, EPUB, Markdown, HTML, or TXT file (60 MB limit).
-2. **Convert** it to any of those six formats.
+1. **Upload** a PDF, DOCX, AZW3, EPUB, Markdown, HTML, or TXT file (150 MB limit).
+2. **Convert** supported documents to the available formats. AZW3 files use
+   KindleUnpack and can be converted to EPUB (EPUB 2) only.
 3. **Split by page/range** — page ranges for PDF, chapter ranges for EPUB, or
    ranges over top-level (`#` / Heading 1) sections for the other formats.
 4. **Split smart by chapters (AI)** — sends a structural outline (not the
@@ -75,6 +76,10 @@ document converter. Concretely:
   (~15,000 characters for chapter-boundary analysis, ~100,000 characters for
   TOC generation) to stay within reasonable request sizes; the UI tells you
   when truncation happened.
+- AZW3 conversion downloads KindleUnpack from its upstream GitHub repository
+  on first use, runs it with `--epub_version=2`, and removes its per-conversion
+  temporary files afterward. AZW3 files are not available for splitting or AI
+  operations until converted to EPUB.
 
 If you need pixel-perfect conversion (e.g. preserving exact DOCX layout in a
 PDF), a different tool (e.g. LibreOffice headless, Pandoc + a PDF engine) is
