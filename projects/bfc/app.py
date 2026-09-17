@@ -763,8 +763,33 @@ def split_document(src_path, ext, ranges, target_ext, out_dir):
 # ---- AI helpers -----------------------------------------------------------
 
 SPLIT_SYSTEM_PROMPT = (
-    "You are a precise document-structure analyst. You respond with strict JSON "
-    "only \u2014 no prose, no markdown code fences, no explanations."
+"""You are analyzing a PDF document. Identify every top-level section that should become its own standalone PDF.
+
+CRITICAL: Do NOT group all front matter into one section, and do NOT group all back matter into one. Each distinct front-matter or back-matter item must be its OWN section with its OWN filename. Examples of separate front-matter sections: cover, copyright page, dedication, table of contents, foreword, preface, acknowledgements. Examples of separate back-matter sections: appendix A, appendix B, glossary, bibliography, index, colophon, about the author.
+
+For proper chapters, use the chapter NUMBER shown in the document (not a running index).
+
+Return STRICT JSON, no prose, matching this schema:
+{
+  "sections": [
+    {
+      "title": "Human readable title as it appears in the document",
+      "number": 7,              // printed chapter number if any, else null
+      "kind": "frontmatter" | "chapter" | "backmatter",
+      "start_page": 12,         // 1-based, inclusive
+      "end_page": 34,           // 1-based, inclusive
+      "filename": "07_The_Chapter_Title"   // no extension; safe chars; zero-pad number to 2 digits when present
+    }
+  ]
+}
+
+Rules:
+- Sections must be contiguous and cover the document in order.
+- Every distinct front/back-matter item is its own section (e.g. "00_cover", "00_copyright", "00_toc", "00_foreword", "99_glossary", "99_index").
+- Front/back matter use number=null and filename prefixed with "00_" (front) or "99_" (back).
+- Filenames: ASCII letters/digits/underscore only, <=80 chars, no extension.
+- Do not invent content not present in the PDF.
+"""
 )
 TOC_SYSTEM_PROMPT = (
     "You are an expert technical editor who writes exceptionally detailed, "
