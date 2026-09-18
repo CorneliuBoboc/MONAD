@@ -316,7 +316,7 @@ def transcribe_file(path, engine, language, device, model_size, hf_token=None, d
 
 
 def get_mlx_worker_count():
-    raw = os.environ.get("DIARIX_MLX_WORKERS", "1")
+    raw = os.environ.get("DIARIX_MLX_WORKERS", "4")
     try:
         workers = int(raw)
     except ValueError:
