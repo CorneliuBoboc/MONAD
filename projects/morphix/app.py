@@ -27,6 +27,8 @@ import zipfile
 import tempfile
 import threading
 import traceback
+import subprocess
+from pathlib import Path
 from xml.sax.saxutils import escape as xml_escape
 
 from flask import Flask, request, jsonify, send_file, session, Response, abort
@@ -96,8 +98,10 @@ os.makedirs(STORAGE_DIR, exist_ok=True)
 MAX_CONTENT_LENGTH = 150 * 1024 * 1024  # 150 MB upload cap
 SESSION_TTL_SECONDS = 2 * 60 * 60      # temp files older than this get swept
 
-ALLOWED_EXTENSIONS = {"pdf", "docx", "epub", "txt", "md", "markdown", "html", "htm"}
+ALLOWED_EXTENSIONS = {"pdf", "docx", "epub", "azw3", "txt", "md", "markdown", "html", "htm"}
 TARGET_FORMATS = {"pdf", "docx", "epub", "md", "html", "txt"}
+KINDLEUNPACK_PATH = None
+_kindleunpack_lock = threading.Lock()
 
 DEFAULT_MODELS = {
     "claude": "claude-sonnet-5",
@@ -187,6 +191,79 @@ def save_manifest(m):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(m, f)
     os.replace(tmp, p)
+
+
+def ensure_kindleunpack():
+    """Download the KindleUnpack script used by ate-bfc when needed."""
+    global KINDLEUNPACK_PATH
+    with _kindleunpack_lock:
+        if KINDLEUNPACK_PATH and os.path.exists(KINDLEUNPACK_PATH):
+            return KINDLEUNPACK_PATH
+
+        repo_path = Path(tempfile.gettempdir()) / "KindleUnpack"
+        script = repo_path / "lib" / "kindleunpack.py"
+        if not script.exists():
+            if repo_path.exists():
+                shutil.rmtree(repo_path)
+            response = requests.get(
+                "https://github.com/kevinhendricks/KindleUnpack/archive/refs/heads/master.zip",
+                timeout=30,
+            )
+            response.raise_for_status()
+            with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    archive.extractall(temp_dir)
+                    extracted = [p for p in Path(temp_dir).iterdir() if p.is_dir()]
+                    if not extracted:
+                        raise RuntimeError("KindleUnpack archive contained no directory.")
+                    shutil.move(str(extracted[0]), str(repo_path))
+            script = repo_path / "lib" / "kindleunpack.py"
+            if not script.exists():
+                raise RuntimeError("kindleunpack.py was not found after download.")
+            script.chmod(0o755)
+
+        KINDLEUNPACK_PATH = str(script)
+        return KINDLEUNPACK_PATH
+
+
+def convert_azw3_to_epub(input_path, original_filename, output_path):
+    """Convert AZW3 using the same KindleUnpack flow as ate-bfc."""
+    temp_outdir = Path(tempfile.mkdtemp(dir=tempfile.gettempdir()))
+    try:
+        unpack_dir = temp_outdir / "unpacked"
+        unpack_dir.mkdir(parents=True)
+        result = subprocess.run(
+            [
+                "python3",
+                ensure_kindleunpack(),
+                "--epub_version=2",
+                str(input_path),
+                str(unpack_dir),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"KindleUnpack failed: {result.stderr.strip()}")
+
+        mobi8_dir = unpack_dir / "mobi8"
+        if mobi8_dir.exists():
+            epub_source = mobi8_dir / (Path(original_filename).stem + ".epub")
+            if not epub_source.exists():
+                epub_files = list(mobi8_dir.glob("*.epub"))
+                if epub_files:
+                    epub_source = epub_files[0]
+                else:
+                    raise RuntimeError(f"No EPUB file found in {mobi8_dir}")
+        else:
+            epub_files = list(unpack_dir.rglob("*.epub"))
+            if not epub_files:
+                raise RuntimeError(f"No EPUB file found in {unpack_dir}")
+            epub_source = epub_files[0]
+        shutil.copy2(str(epub_source), output_path)
+    finally:
+        shutil.rmtree(temp_outdir, ignore_errors=True)
 
 
 def register_file(file_id, filename, ext, stored_name, meta):
@@ -1200,11 +1277,16 @@ def api_convert_batch():
             errors.append({"file_id": file_id, "error": "File not found or expired."})
             continue
         try:
-            blocks = extract_blocks(rec["abs_path"], rec["ext"])
             out_id = uuid.uuid4().hex
             stored_name = f"{out_id}.{target}"
             out_path = os.path.join(session_dir(), stored_name)
-            render_blocks(blocks, target, out_path)
+            if rec["ext"] == "azw3":
+                if target != "epub":
+                    raise ValueError("AZW3 files can only be converted to EPUB.")
+                convert_azw3_to_epub(rec["abs_path"], rec["filename"], out_path)
+            else:
+                blocks = extract_blocks(rec["abs_path"], rec["ext"])
+                render_blocks(blocks, target, out_path)
             fname = f"{safe_stem(rec['filename'])}.{target}"
             register_output(out_id, fname, target, stored_name)
             outputs.append({"output_id": out_id, "filename": fname})
@@ -1250,15 +1332,19 @@ def api_convert():
     rec = get_file_record(file_id)
     if not rec:
         return jsonify(error="File not found or session expired. Please re-upload."), 404
-    try:
-        blocks = extract_blocks(rec["abs_path"], rec["ext"])
-    except Exception as e:
-        return jsonify(error=f"Could not read source document: {e}"), 400
     out_id = uuid.uuid4().hex
     stored_name = f"{out_id}.{target}"
     out_path = os.path.join(session_dir(), stored_name)
     try:
-        render_blocks(blocks, target, out_path)
+        if rec["ext"] == "azw3":
+            if target != "epub":
+                return jsonify(error="AZW3 files can only be converted to EPUB."), 400
+            convert_azw3_to_epub(rec["abs_path"], rec["filename"], out_path)
+        else:
+            blocks = extract_blocks(rec["abs_path"], rec["ext"])
+            render_blocks(blocks, target, out_path)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
     except Exception as e:
         return jsonify(error=f"Conversion failed: {e}"), 500
     fname = f"{safe_stem(rec['filename'])}.{target}"
@@ -1277,6 +1363,8 @@ def api_split():
     rec = get_file_record(file_id)
     if not rec:
         return jsonify(error="File not found or session expired. Please re-upload."), 404
+    if rec["ext"] == "azw3":
+        return jsonify(error="AZW3 files can only be converted to EPUB before splitting."), 400
     if target and target not in TARGET_FORMATS:
         return jsonify(error="Unsupported target format."), 400
     target = target or rec["ext"]
@@ -1335,6 +1423,8 @@ def api_ai_split():
     rec = get_file_record(file_id)
     if not rec:
         return jsonify(error="File not found or session expired. Please re-upload."), 404
+    if rec["ext"] == "azw3":
+        return jsonify(error="AZW3 files must be converted to EPUB before AI operations."), 400
     if target and target not in TARGET_FORMATS:
         return jsonify(error="Unsupported target format."), 400
     target = target or rec["ext"]
@@ -1418,6 +1508,8 @@ def api_ai_toc():
     rec = get_file_record(file_id)
     if not rec:
         return jsonify(error="File not found or session expired. Please re-upload."), 404
+    if rec["ext"] == "azw3":
+        return jsonify(error="AZW3 files must be converted to EPUB before AI operations."), 400
 
     key = resolve_api_key(provider, api_key)
     if not key:
@@ -1633,19 +1725,19 @@ PAGE_HTML = r"""<!DOCTYPE html>
     <!-- TAB 1: DOCUMENT -->
     <section class="tab-panel active" id="tab-document">
       <h3 class="panel-title">Upload document(s)</h3>
-      <p class="hint">Supports PDF, DOCX, EPUB, Markdown, HTML and TXT &mdash; up to 60&nbsp;MB. You can drop several files at once for batch conversion.</p>
+      <p class="hint">Supports PDF, DOCX, AZW3, EPUB, Markdown, HTML and TXT &mdash; up to 60&nbsp;MB per upload. Add files from several folders; the pool stays open until you choose an operation.</p>
       <div class="dropzone" id="dropzone" tabindex="0" role="button" aria-label="Upload files">
         <div class="big">Drop files here, or click to choose one or more</div>
-        <div class="small">.pdf &nbsp;.docx &nbsp;.epub &nbsp;.md &nbsp;.html &nbsp;.txt</div>
+        <div class="small">.pdf &nbsp;.docx &nbsp;.azw3 &nbsp;.epub &nbsp;.md &nbsp;.html &nbsp;.txt</div>
       </div>
-      <input type="file" id="fileInput" multiple accept=".pdf,.docx,.epub,.md,.markdown,.html,.htm,.txt">
+      <input type="file" id="fileInput" multiple accept=".pdf,.docx,.azw3,.epub,.md,.markdown,.html,.htm,.txt">
       <div id="fileCard" style="display:none" class="file-card">
         <div style="flex:1;min-width:0">
           <div class="name" id="fileName"></div>
           <div class="meta" id="fileMeta"></div>
           <div class="file-list" id="fileList"></div>
         </div>
-        <button class="btn secondary" id="changeFileBtn" type="button">Change files</button>
+        <button class="btn secondary" id="changeFileBtn" type="button">Clear file pool</button>
       </div>
       <div class="status" id="uploadStatus"></div>
       <div class="actions">
@@ -1872,13 +1964,15 @@ PAGE_HTML = r"""<!DOCTYPE html>
       .then(function(r){ return r.json().then(function(j){ return {ok:r.ok, body:j}; }); })
       .then(function(res){
         if (!res.ok) { setStatus(statusEl, res.body.error || 'Upload failed.', 'err'); return; }
-        state.files = res.body.files || [];
-        if (!state.files.length) {
+        var uploaded = res.body.files || [];
+        if (!uploaded.length && !state.files.length) {
           setStatus(statusEl, 'No usable files uploaded.', 'err');
           return;
         }
-        dropzone.style.display = 'none';
-        $('#fileCard').style.display = 'flex';
+        // Each picker/drop operation is an addition to the session's pool.
+        // Keep the dropzone open so files can be gathered from other folders.
+        state.files = state.files.concat(uploaded);
+        $('#fileCard').style.display = state.files.length ? 'flex' : 'none';
         renderFileCard();
         var errs = res.body.errors || [];
         if (errs.length) {
@@ -1887,7 +1981,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
             errs.map(function(e){ return e.filename + ' (' + e.error + ')'; }).join('; '),
             'err');
         } else {
-          setStatus(statusEl, '', '');
+          setStatus(statusEl, state.files.length + ' file(s) ready. Add more or choose an operation.', 'ok');
         }
         $('#toOperationBtn').disabled = false;
         unlockTab('operation');
@@ -1936,9 +2030,10 @@ PAGE_HTML = r"""<!DOCTYPE html>
   // more than one file is loaded.
   function refreshOpAvailability(){
     var multi = state.files.length > 1;
+    var hasAzw3 = state.files.some(function(f){ return f.ext === 'azw3'; });
     $all('.op-item').forEach(function(o){
       var singleOnly = o.dataset.op !== 'convert';
-      var blocked = multi && singleOnly;
+      var blocked = (multi || hasAzw3) && singleOnly;
       o.classList.toggle('disabled-op', blocked);
       if (blocked && o.querySelector('input').checked) {
         o.querySelector('input').checked = false;
@@ -2013,7 +2108,12 @@ PAGE_HTML = r"""<!DOCTYPE html>
     $('#ctrl-' + op).classList.add('active');
 
     if (op === 'convert') {
+      var hasAzw3 = state.files.some(function(f){ return f.ext === 'azw3'; });
       populateFormatSelect($('#convertTarget'), false);
+      $all('#convertTarget option').forEach(function(option){
+        option.disabled = hasAzw3 && option.value !== 'epub';
+      });
+      if (hasAzw3) $('#convertTarget').value = 'epub';
     }
     if (op === 'split') {
       var meta = (state.files[0] && state.files[0].meta) || {};

@@ -9,7 +9,7 @@
   | App | Purpose | Local port |
   | --- | --- | ---: |
   | `diarix` | Media upload, trimming, transcription, and optional diarization | 5030 |
-  | `bfc` | Document conversion and split utilities with optional AI chapter/TOC generation | 5034 |
+  | `morphix` | Document conversion and split utilities with optional AI chapter/TOC generation | 5034 |
   | `pdfutils` | PDF utilities such as splitting and chapter detection | 5009 |
   | `vd` | Video download and local media processing | 5005 |
 
@@ -56,7 +56,7 @@
 
   ```bash
   bash ./test.sh diarix
-  bash ./test.sh bfc
+  bash ./test.sh morphix
   bash ./test.sh vd
   bash ./test.sh pdfutils
   ```
@@ -64,7 +64,7 @@
   Open `index.html` in a browser, or visit these URLs once launched:
 
   - <http://127.0.0.1:5030> (`diarix`)
-  - <http://127.0.0.1:5034> (`bfc`)
+  - <http://127.0.0.1:5034> (`morphix`)
   - <http://127.0.0.1:5009> (`pdfutils`)
   - <http://127.0.0.1:5005> (`vd`)
 
@@ -80,7 +80,7 @@
   python app.py
   ```
 
-  Use the corresponding directory and requirements file for `bfc`, `pdfutils`,
+  Use the corresponding directory and requirements file for `morphix`, `pdfutils`,
   or `vd`.
 
   ## Environment variables
@@ -131,7 +131,7 @@
   ├── zsh_aliases         # Local shell aliases
   └── projects/
       ├── diarix/
-      ├── bfc/
+      ├── morphix/
       ├── pdfutils/
       └── vd/
   ```
