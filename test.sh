@@ -16,7 +16,7 @@ if echo "$APP"|grep -qv "^morphix$"; then
 fi
 python$VER -m pip install -r requirements.txt
 if echo "$APP"|grep -q "^diarix$"; then
-  export DIARIX_MLX_WORKERS=4
+  export DIARIX_MLX_WORKERS=1
   $DEMO || command -v whispermlx  || pip install whispermlx 
 fi
 
