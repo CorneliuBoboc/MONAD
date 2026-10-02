@@ -320,9 +320,9 @@ def get_mlx_worker_count():
     try:
         workers = int(raw)
     except ValueError:
-        raise RuntimeError("DIARIX_MLX_WORKERS must be an integer from 1 to 4.")
-    if not 1 <= workers <= 4:
-        raise RuntimeError("DIARIX_MLX_WORKERS must be an integer from 1 to 4.")
+        raise RuntimeError("DIARIX_MLX_WORKERS must be an integer from 1 to 1.")
+    if not 1 <= workers <= 1:
+        raise RuntimeError("DIARIX_MLX_WORKERS must be an integer from 1 to 1.")
     return workers
 
 
