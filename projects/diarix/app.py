@@ -840,7 +840,8 @@ def api_transcribe():
         results = []
         errors = []
         try:
-            if engine == "mlx":
+            # Transcribe files in turn (not simultaneously), even for mlx
+            if False and engine == "mlx":
                 workers = get_mlx_worker_count()
                 with ThreadPoolExecutor(max_workers=workers) as executor:
                     futures = [
