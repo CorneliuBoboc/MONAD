@@ -18,7 +18,6 @@ import shutil
 import subprocess
 import tempfile
 import zipfile
-from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 from uuid import uuid4
 
@@ -75,6 +74,9 @@ def get_session(sid, create=False):
             "source_files": [],   # list of loaded files (multi-file support)
             "multifile": False,   # True only for multi-disk uploads
             "transcriptions": [], # list of per-file transcriptions (multi-file mode)
+            "transcription_status": {
+                "state": "idle", "completed": 0, "total": 0, "error": None,
+            },
         }
         SESSIONS[sid] = sess
     return sess
@@ -91,6 +93,9 @@ def wipe_session_dir(sess):
     sess["source_files"] = []
     sess["multifile"] = False
     sess["transcriptions"] = []
+    sess["transcription_status"] = {
+        "state": "idle", "completed": 0, "total": 0, "error": None,
+    }
 
 
 def fmt_ts(t):
@@ -315,17 +320,6 @@ def transcribe_file(path, engine, language, device, model_size, hf_token=None, d
     raise RuntimeError(f"Unknown transcription engine '{engine}'.")
 
 
-def get_mlx_worker_count():
-    raw = os.environ.get("DIARIX_MLX_WORKERS", "4")
-    try:
-        workers = int(raw)
-    except ValueError:
-        raise RuntimeError("DIARIX_MLX_WORKERS must be an integer from 1 to 4.")
-    if not 1 <= workers <= 4:
-        raise RuntimeError("DIARIX_MLX_WORKERS must be an integer from 1 to 4.")
-    return workers
-
-
 # --------------------------------------------------------------------------
 # diarization
 # --------------------------------------------------------------------------
@@ -496,6 +490,8 @@ def media_source(sid):
 def api_load():
     sid = ensure_sid()
     sess = get_session(sid, create=True)
+    if sess["transcription_status"]["state"] == "running":
+        return jsonify(error="Wait for the current transcription to finish before adding files."), 409
 
     up_list = request.files.getlist("files") or []
     single = request.files.get("file")
@@ -542,6 +538,10 @@ def api_load():
 
         sess["source_files"].extend(loaded)
         sess["multifile"] = len(sess["source_files"]) > 1
+        sess["transcriptions"] = []
+        sess["transcription_status"] = {
+            "state": "idle", "completed": 0, "total": 0, "error": None,
+        }
 
         first = sess["source_files"][0]
         sess["source"] = {
@@ -837,40 +837,21 @@ def api_transcribe():
 
     # ---- multi-file path: one transcription per source file, NOT concatenated ----
     if sess.get("multifile"):
+        if sess["transcription_status"]["state"] == "running":
+            return jsonify(error="A transcription is already running for this session."), 409
         results = []
-        errors = []
+        source_files = list(sess["source_files"])
+        sess["transcriptions"] = results
+        sess["transcript"] = None
+        sess["transcription_status"] = {
+            "state": "running", "completed": 0, "total": len(source_files), "error": None,
+        }
         try:
-            if engine == "mlx":
-                workers = get_mlx_worker_count()
-                with ThreadPoolExecutor(max_workers=workers) as executor:
-                    futures = [
-                        executor.submit(
-                            transcribe_file,
-                            f["path"], engine, language, device, model_size,
-                            api_key, diarize,
-                        )
-                        for f in sess["source_files"]
-                    ]
-                    transcriptions = []
-                    for f, future in zip(sess["source_files"], futures):
-                        try:
-                            transcriptions.append((f, future.result()))
-                        except Exception as e:
-                            errors.append({"name": f["name"], "error": str(e)})
-            else:
-                transcriptions = [
-                    (
-                        f,
-                        transcribe_file(
-                            f["path"], engine, language, device, model_size,
-                            hf_token=api_key,
-                            diarize=False,
-                        ),
-                    )
-                    for f in sess["source_files"]
-                ]
-
-            for f, segs in transcriptions:
+            for f in source_files:
+                segs = transcribe_file(
+                    f["path"], engine, language, device, model_size,
+                    hf_token=api_key, diarize=False,
+                )
                 # ensure segment dicts are JSON-safe and have consistent keys
                 norm_segs = []
                 for s in segs:
@@ -893,6 +874,9 @@ def api_transcribe():
                         for seg, label in zip(norm_segs, labels):
                             seg["speaker"] = label
                     else:
+                        sess["transcription_status"].update(
+                            state="failed", error="Choose a diarization method (pyannote or AI API)."
+                        )
                         return jsonify(error="Choose a diarization method (pyannote or AI API)."), 400
 
                 lines = []
@@ -906,22 +890,26 @@ def api_transcribe():
                     "transcript": text,
                     "segments": norm_segs,
                 })
+                sess["transcriptions"] = list(results)
+                sess["transcript"] = "\n\n".join(
+                    f"===== {r['name']} =====\n{r['transcript']}" for r in results
+                )
+                sess["transcription_status"]["completed"] = len(results)
         except RuntimeError as e:
+            sess["transcription_status"].update(state="failed", error=str(e))
             return jsonify(error=str(e)), 500
         except Exception as e:
+            sess["transcription_status"].update(
+                state="failed", error=f"Transcription failed: {e}"
+            )
             return jsonify(error=f"Transcription failed: {e}"), 500
 
-        sess["transcriptions"] = results
-        # For convenience: also keep a combined transcript for the ZIP export.
-        sess["transcript"] = "\n\n".join(
-            f"===== {r['name']} =====\n{r['transcript']}" for r in results
-        )
         sess["segments"] = []  # no combined segments in multi-file mode
+        sess["transcription_status"]["state"] = "complete"
 
         return jsonify(
             multifile=True,
             transcriptions=results,
-            errors=errors,
             # Provide an empty combined transcript so the single-textarea UI
             # still works if someone falls back to it; but frontend will use
             # `transcriptions` for multi-file.
@@ -994,6 +982,22 @@ def api_transcribe():
     sess["segments"] = all_segments
     sess["transcriptions"] = []
     return jsonify(transcript=transcript, segments=all_segments)
+
+
+@app.route("/api/transcribe/status")
+def api_transcribe_status():
+    sid = get_sid_or_none()
+    sess = get_session(sid) if sid else None
+    if not sess:
+        return jsonify(error="No transcription session found."), 404
+    transcriptions = sess.get("transcriptions") or []
+    status = dict(sess["transcription_status"])
+    if status["state"] == "running":
+        status["completed"] = len(transcriptions)
+    return jsonify(
+        status=status,
+        transcriptions=transcriptions,
+    )
 
 
 @app.route("/api/rename_speakers", methods=["POST"])
@@ -1539,6 +1543,7 @@ footer{flex:0 0 auto; padding:9px 22px; text-align:center; font-size:11px; color
           <div class="download-row">
             <button class="btn secondary" id="downloadZipBtnMulti">Download zip file</button>
           </div>
+          <div class="empty-note" id="multiResultStatus"></div>
           <div id="multiResultList" class="multi-results"></div>
         </div>
       </div>
@@ -2041,21 +2046,55 @@ document.getElementById('transcribeBtn').addEventListener('click', async ()=>{
 
   btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Transcribing…';
   try{
-    const data = await api('/api/transcribe', {
+    const requestOptions = {
       method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload),
-    });
+    };
+    if (state.multifile) {
+      goTab('extract');
+      state.transcriptions = [];
+      renderMultiTranscriptions(state.transcriptions, {
+        state:'running', completed:0, total:state.fileCount,
+      });
+      let requestSettled = false;
+      const transcriptionRequest = api('/api/transcribe', requestOptions)
+        .then(data => ({data}), error => ({error}))
+        .finally(() => { requestSettled = true; });
 
-    if (data.multifile) {
-      state.transcriptions = data.transcriptions || [];
-      renderMultiTranscriptions(state.transcriptions);
+      let lastCount = -1;
+      while (true) {
+        const progress = await api('/api/transcribe/status');
+        const items = progress.transcriptions || [];
+        if (items.length !== lastCount) {
+          state.transcriptions = items;
+          renderMultiTranscriptions(items, progress.status);
+          lastCount = items.length;
+        } else {
+          updateMultiTranscriptionStatus(progress.status);
+        }
+        if (progress.status.state === 'complete' || progress.status.state === 'failed') break;
+        if (requestSettled && progress.status.state === 'idle') {
+          const outcome = await transcriptionRequest;
+          if (outcome.error) throw outcome.error;
+          break;
+        }
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+
+      const outcome = await transcriptionRequest;
+      if (outcome.error) throw outcome.error;
+      state.transcriptions = outcome.data.transcriptions || [];
+      renderMultiTranscriptions(state.transcriptions, {
+        state:'complete', completed:state.transcriptions.length, total:state.transcriptions.length,
+      });
     } else {
+      const data = await api('/api/transcribe', requestOptions);
       state.transcriptions = [];
       state.segments = data.segments;
       document.getElementById('transcriptOut').value = data.transcript;
       setupSpeakerRenamePanel(data.segments);
       showSingleResults();
+      goTab('extract');
     }
-    goTab('extract');
   }catch(e){ toast(e.message); }
   finally{ btn.disabled = false; btn.textContent = 'Transcribe'; }
 });
@@ -2064,6 +2103,7 @@ document.getElementById('transcribeBtn').addEventListener('click', async ()=>{
 const singleResultWrap = document.getElementById('singleResultWrap');
 const multiResultWrap = document.getElementById('multiResultWrap');
 const multiResultList = document.getElementById('multiResultList');
+const multiResultStatus = document.getElementById('multiResultStatus');
 
 function showSingleResults(){
   singleResultWrap.classList.remove('hidden');
@@ -2078,14 +2118,32 @@ function clearResultsUI(){
   document.getElementById('transcriptOut').value = '';
   document.getElementById('speakerRenamePanel').classList.add('hidden');
   multiResultList.innerHTML = '';
+  multiResultStatus.textContent = '';
   state.transcriptions = [];
   showSingleResults();
 }
 
-function renderMultiTranscriptions(items){
+function updateMultiTranscriptionStatus(status){
+  if (!status) {
+    multiResultStatus.textContent = '';
+  } else if (status.state === 'running') {
+    multiResultStatus.textContent = status.completed
+      ? `Ready: ${status.completed} of ${status.total} files. Transcribing the next file…`
+      : `Waiting for the first transcription (${status.total} files)…`;
+  } else if (status.state === 'failed') {
+    multiResultStatus.textContent =
+      `Transcription stopped after ${status.completed} of ${status.total} files. Completed results remain available.`;
+  } else if (status.state === 'complete') {
+    multiResultStatus.textContent = `All ${status.completed} files transcribed.`;
+  } else {
+    multiResultStatus.textContent = '';
+  }
+}
+
+function renderMultiTranscriptions(items, status){
   multiResultList.innerHTML = '';
   if (!items || items.length === 0){
-    multiResultList.innerHTML = '<div class="empty-note">No transcriptions returned.</div>';
+    updateMultiTranscriptionStatus(status);
     showMultiResults();
     return;
   }
@@ -2122,6 +2180,7 @@ function renderMultiTranscriptions(items){
     multiResultList.appendChild(wrap);
   });
 
+  updateMultiTranscriptionStatus(status);
   showMultiResults();
 }
 
