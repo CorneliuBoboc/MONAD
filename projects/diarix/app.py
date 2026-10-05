@@ -23,18 +23,18 @@ from uuid import uuid4
 
 import requests
 from flask import (
-    Flask, request, session, jsonify, send_file, abort, render_template_string
+    Flask, request, jsonify, send_file, abort, render_template_string
 )
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("MEDIA_EDITOR_SECRET", os.urandom(32))
 
 BASE_DIR = os.path.join(tempfile.gettempdir(), "media_editor_sessions")
 os.makedirs(BASE_DIR, exist_ok=True)
 
-# in-memory session registry: sid -> {dir, source, chunks, transcript, segments, ...}
+# In-memory workspace registry: sid -> {dir, source, chunks, transcript, segments, ...}
 SESSIONS = {}
+ACTIVE_SID = None
 
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
 AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus"}
@@ -45,24 +45,23 @@ VALID_LANGUAGES = {"auto", "de", "en", "fr", "ro"}
 
 
 # --------------------------------------------------------------------------
-# session / filesystem helpers
+# workspace / filesystem helpers
 # --------------------------------------------------------------------------
 
 def ensure_sid():
-    sid = session.get("sid")
-    if not sid:
-        sid = uuid4().hex
-        session["sid"] = sid
-    return sid
+    global ACTIVE_SID
+    if ACTIVE_SID is None:
+        ACTIVE_SID = uuid4().hex
+    return ACTIVE_SID
 
 
 def get_sid_or_none():
-    return session.get("sid")
+    return ACTIVE_SID
 
 
 def get_session(sid, create=False):
     sess = SESSIONS.get(sid)
-    if sess is None and create:
+    if (True or sess is None) and create:
         d = os.path.join(BASE_DIR, sid)
         os.makedirs(d, exist_ok=True)
         sess = {
