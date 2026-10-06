@@ -17,24 +17,48 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import wraps
 from urllib.parse import urlparse
 from uuid import uuid4
 
 import requests
 from flask import (
-    Flask, request, session, jsonify, send_file, abort, render_template_string
+    Flask, request, jsonify, send_file, abort, render_template_string
 )
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("MEDIA_EDITOR_SECRET", os.urandom(32))
 
 BASE_DIR = os.path.join(tempfile.gettempdir(), "media_editor_sessions")
-os.makedirs(BASE_DIR, exist_ok=True)
 
-# in-memory session registry: sid -> {dir, source, chunks, transcript, segments, ...}
+# In-memory workspace registry: sid -> {dir, source, chunks, transcript, segments, ...}
 SESSIONS = {}
+ACTIVE_SID = None
+_SESS_LOCK = threading.RLock()
+
+# GPU work is serialized by default (single permitted thread). Override via
+# DIARIX_GPU_WORKERS only as an experimental escape hatch; values <1 or
+# invalid fall back to 1. DIARIX_FORCE_SEQUENTIAL=1 disables all pools.
+GPU_DEVICES = {"cuda", "metal"}
+
+
+def gpu_worker_count():
+    """GPU concurrency. Default and hard fallback: a single thread."""
+    raw = os.environ.get("DIARIX_GPU_WORKERS", "1").strip()
+    try:
+        workers = int(raw)
+    except ValueError:
+        return 1
+    if workers < 1:
+        return 1
+    # Cap experimental multi-GPU-thread attempts.
+    return min(workers, 4)
+
+
+_GPU_GATE = threading.Semaphore(gpu_worker_count())
 
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
 AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus"}
@@ -45,41 +69,77 @@ VALID_LANGUAGES = {"auto", "de", "en", "fr", "ro"}
 
 
 # --------------------------------------------------------------------------
-# session / filesystem helpers
+# workspace / filesystem helpers
 # --------------------------------------------------------------------------
 
+def _empty_transcription_status():
+    return {"state": "idle", "completed": 0, "total": 0, "error": None}
+
+
+def _new_session_dict(sid):
+    d = os.path.join(BASE_DIR, sid)
+    os.makedirs(d, exist_ok=True)
+    return {
+        "dir": d,
+        "source": None,
+        "chunks": [],
+        "transcript": None,
+        "segments": [],
+        "source_files": [],   # list of loaded files (multi-file support)
+        "multifile": False,   # True only for multi-disk uploads
+        "transcriptions": [], # list of per-file transcriptions (multi-file mode)
+        "transcription_status": _empty_transcription_status(),
+        "lock": threading.RLock(),
+    }
+
+
+def purge_all_session_dirs():
+    """Remove leftover session dirs from previous server processes."""
+    global ACTIVE_SID
+    with _SESS_LOCK:
+        SESSIONS.clear()
+        ACTIVE_SID = None
+        if os.path.isdir(BASE_DIR):
+            shutil.rmtree(BASE_DIR, ignore_errors=True)
+        os.makedirs(BASE_DIR, exist_ok=True)
+
+
+# Fresh disk state on every process start — no stale audio from prior runs.
+purge_all_session_dirs()
+
+
 def ensure_sid():
-    sid = session.get("sid")
-    if not sid:
-        sid = uuid4().hex
-        session["sid"] = sid
-    return sid
+    global ACTIVE_SID
+    with _SESS_LOCK:
+        if ACTIVE_SID is None:
+            ACTIVE_SID = uuid4().hex
+        return ACTIVE_SID
 
 
 def get_sid_or_none():
-    return session.get("sid")
+    return ACTIVE_SID
 
 
 def get_session(sid, create=False):
-    sess = SESSIONS.get(sid)
-    if sess is None and create:
-        d = os.path.join(BASE_DIR, sid)
-        os.makedirs(d, exist_ok=True)
-        sess = {
-            "dir": d,
-            "source": None,
-            "chunks": [],
-            "transcript": None,
-            "segments": [],
-            "source_files": [],   # list of loaded files (multi-file support)
-            "multifile": False,   # True only for multi-disk uploads
-            "transcriptions": [], # list of per-file transcriptions (multi-file mode)
-            "transcription_status": {
-                "state": "idle", "completed": 0, "total": 0, "error": None,
-            },
-        }
-        SESSIONS[sid] = sess
-    return sess
+    if not sid:
+        return None
+    with _SESS_LOCK:
+        sess = SESSIONS.get(sid)
+        if sess is None and create:
+            sess = _new_session_dict(sid)
+            SESSIONS[sid] = sess
+        return sess
+
+
+def serialize_current_session(view):
+    """Keep session file operations atomic against transcription and other edits."""
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        sid = ensure_sid()
+        sess = get_session(sid, create=True)
+        with sess["lock"]:
+            return view(*args, _session=sess, _sid=sid, **kwargs)
+    return wrapped
 
 
 def wipe_session_dir(sess):
@@ -93,9 +153,151 @@ def wipe_session_dir(sess):
     sess["source_files"] = []
     sess["multifile"] = False
     sess["transcriptions"] = []
-    sess["transcription_status"] = {
-        "state": "idle", "completed": 0, "total": 0, "error": None,
+    sess["transcription_status"] = _empty_transcription_status()
+
+
+def public_file_entry(f):
+    return {
+        "id": f["id"],
+        "name": f["name"],
+        "kind": f["kind"],
+        "duration": f["duration"],
+        "file_size": f["file_size"],
     }
+
+
+def sync_primary_source(sess):
+    """Keep sess['source'] / multifile flags aligned with source_files order."""
+    files = sess["source_files"]
+    sess["multifile"] = len(files) > 1
+    if not files:
+        sess["source"] = None
+        return
+    first = files[0]
+    sess["source"] = {
+        "path": first["path"],
+        "ext": first["ext"],
+        "kind": first["kind"],
+        "duration": first["duration"],
+        "file_size": first["file_size"],
+        "format": first["format"],
+        "video_info": first["video_info"],
+        "audio_info": first["audio_info"],
+    }
+
+
+def clear_file_pool(sess):
+    """Clear loaded sources, chunks, and results without removing session state."""
+    paths = [f.get("path") for f in sess.get("source_files", [])]
+    paths.extend(c.get("path") for c in sess.get("chunks", []))
+    failures = []
+    for path in paths:
+        if not path:
+            continue
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            app.logger.warning("Could not remove media file %s", path, exc_info=True)
+            failures.append(path)
+
+    if failures:
+        return len(failures)
+    sess["chunks"] = []
+    sess["transcriptions"] = []
+    sess["transcript"] = None
+    sess["segments"] = []
+    sess["transcription_status"] = _empty_transcription_status()
+    sess["source_files"] = []
+    sync_primary_source(sess)
+    return 0
+
+
+def files_payload(sess, sid):
+    files = sess["source_files"]
+    if not files:
+        return {
+            "kind": None, "duration": 0, "src": None, "file_size": 0,
+            "format": None, "video_info": None, "audio_info": None,
+            "multifile": False, "file_count": 0, "files": [],
+        }
+    first = files[0]
+    return {
+        "kind": first["kind"],
+        "duration": first["duration"],
+        "src": f"/media/{sid}/source",
+        "file_size": first["file_size"],
+        "format": first["format"],
+        "video_info": first["video_info"],
+        "audio_info": first["audio_info"],
+        "multifile": sess["multifile"],
+        "file_count": len(files),
+        "files": [public_file_entry(f) for f in files],
+    }
+
+
+def force_sequential():
+    return os.environ.get("DIARIX_FORCE_SEQUENTIAL", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def cpu_worker_count(n_tasks):
+    """How many CPU workers to use; always at least 1, never above n_tasks."""
+    n_tasks = max(1, int(n_tasks))
+    raw = os.environ.get("DIARIX_CPU_WORKERS", "").strip()
+    if raw:
+        try:
+            return max(1, min(int(raw), n_tasks))
+        except ValueError:
+            pass
+    return max(1, min(os.cpu_count() or 2, n_tasks, 8))
+
+
+def uses_gpu_device(engine, device):
+    if engine == "mlx":
+        return True
+    return (device or "").lower() in GPU_DEVICES
+
+
+def run_cpu_jobs(jobs, worker_count=None):
+    """Run callables in parallel on CPU. Each job is a zero-arg callable.
+
+    Returns a list of results in the same order as `jobs`.
+    Falls back to sequential execution on pool failure.
+    """
+    if not jobs:
+        return []
+    if force_sequential() or len(jobs) == 1:
+        return [job() for job in jobs]
+
+    workers = worker_count if worker_count is not None else cpu_worker_count(len(jobs))
+    workers = max(1, min(workers, len(jobs)))
+    if workers == 1:
+        return [job() for job in jobs]
+
+    try:
+        results = [None] * len(jobs)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(job): i for i, job in enumerate(jobs)}
+            for fut in as_completed(futures):
+                results[futures[fut]] = fut.result()
+        return results
+    except Exception as exc:
+        app.logger.warning("CPU pool failed (%s); falling back to sequential.", exc)
+        return [job() for job in jobs]
+
+
+def run_gpu_exclusive(fn):
+    """Run fn holding the process-wide GPU gate (single permitted thread)."""
+    acquired = _GPU_GATE.acquire(timeout=3600)
+    if not acquired:
+        raise RuntimeError("Timed out waiting for the GPU transcription slot.")
+    try:
+        return fn()
+    finally:
+        _GPU_GATE.release()
 
 
 def fmt_ts(t):
@@ -307,7 +509,7 @@ def run_mlx_whisper_cli(path, language, model_size, hf_token=None, diarize=False
         raise RuntimeError(f"Failed to parse whispermlx output: {e}")
 
 
-def transcribe_file(path, engine, language, device, model_size, hf_token=None, diarize=False):
+def _transcribe_file_unlocked(path, engine, language, device, model_size, hf_token=None, diarize=False):
     # Normalize "auto" and unknown codes to None for the Python engines.
     lang = normalize_language(language)
     if engine == "openai-whisper":
@@ -318,6 +520,182 @@ def transcribe_file(path, engine, language, device, model_size, hf_token=None, d
         # MLX CLI takes an explicit "auto" string (handled inside the runner).
         return run_mlx_whisper_cli(path, lang, model_size, hf_token, diarize)
     raise RuntimeError(f"Unknown transcription engine '{engine}'.")
+
+
+def transcribe_file(path, engine, language, device, model_size, hf_token=None, diarize=False):
+    """Transcribe one file. GPU/Metal/MLX calls are serialized process-wide."""
+    def _run():
+        return _transcribe_file_unlocked(
+            path, engine, language, device, model_size, hf_token=hf_token, diarize=diarize,
+        )
+
+    if uses_gpu_device(engine, device):
+        # Experimental multi-worker GPU still funnels through the gate so the
+        # hardware sees one job at a time unless the semaphore is widened.
+        return run_gpu_exclusive(_run)
+    return _run()
+
+
+def normalize_segments(segs):
+    norm_segs = []
+    for s in segs or []:
+        seg = {
+            "start": float(s.get("start", 0.0)),
+            "end": float(s.get("end", 0.0)),
+            "text": (s.get("text") or "").strip(),
+        }
+        if s.get("speaker"):
+            seg["speaker"] = s["speaker"]
+        norm_segs.append(seg)
+    return norm_segs
+
+
+def segments_to_transcript(norm_segs):
+    lines = []
+    for seg in norm_segs:
+        prefix = f"{seg['speaker']}: " if seg.get("speaker") else ""
+        lines.append(f"[{fmt_ts(seg['start'])} - {fmt_ts(seg['end'])}] {prefix}{seg['text']}")
+    return "\n".join(lines)
+
+
+def apply_diarization_to_segments(
+    path, norm_segs, diarize, diarize_method, ai_provider, api_key, num_speakers,
+):
+    if not diarize or any(s.get("speaker") for s in norm_segs):
+        return norm_segs
+    if diarize_method == "pyannote":
+        turns = run_pyannote(path, api_key, num_speakers)
+        assign_speakers_from_turns(norm_segs, turns)
+    elif diarize_method == "ai_api":
+        labels = run_ai_diarization(norm_segs, ai_provider, api_key, num_speakers)
+        for seg, label in zip(norm_segs, labels):
+            seg["speaker"] = label
+    else:
+        raise RuntimeError("Choose a diarization method (pyannote or AI API).")
+    return norm_segs
+
+
+def transcribe_one_source_file(
+    f, engine, language, device, model_size,
+    diarize, diarize_method, ai_provider, api_key, num_speakers,
+):
+    """Full per-file pipeline used by multi-file mode."""
+    segs = transcribe_file(
+        f["path"], engine, language, device, model_size,
+        hf_token=api_key, diarize=False,
+    )
+    norm_segs = normalize_segments(segs)
+    apply_diarization_to_segments(
+        f["path"], norm_segs, diarize, diarize_method, ai_provider, api_key, num_speakers,
+    )
+    text = segments_to_transcript(norm_segs)
+    return {"name": f["name"], "id": f.get("id"), "transcript": text, "segments": norm_segs}
+
+
+def publish_ready_transcriptions(sess, slots, publish_lock):
+    """Expose every finished file, ordered by its position in the source list."""
+    with publish_lock, sess["lock"]:
+        results = [item for item in slots if item is not None]
+        sess["transcriptions"] = results
+        # Multi-file results remain independent; never create a combined transcript.
+        sess["transcript"] = None
+        sess["transcription_status"]["completed"] = len(results)
+        return list(results)
+
+
+def run_multifile_transcriptions(
+    sess, source_files, engine, language, device, model_size,
+    diarize, diarize_method, ai_provider, api_key, num_speakers,
+):
+    """Transcribe many files with CPU parallelism / GPU serialization.
+
+    Results are published one-by-one in the user-established file order, even
+    when workers finish out of order.
+    """
+    n = len(source_files)
+    slots = [None] * n
+    publish_lock = threading.Lock()
+    first_error = []
+
+    def work(idx, f):
+        try:
+            return idx, transcribe_one_source_file(
+                f, engine, language, device, model_size,
+                diarize, diarize_method, ai_provider, api_key, num_speakers,
+            ), None
+        except Exception as exc:
+            return idx, None, exc
+
+    def consume(idx, result, exc):
+        if exc is not None:
+            first_error.append(exc)
+            return
+        slots[idx] = result
+        return publish_ready_transcriptions(sess, slots, publish_lock)
+
+    def run_sequential():
+        for idx, f in enumerate(source_files):
+            idx2, result, exc = work(idx, f)
+            consume(idx2, result, exc)
+        if first_error:
+            raise first_error[0]
+        return list(sess["transcriptions"])
+
+    on_gpu = uses_gpu_device(engine, device)
+
+    if force_sequential() or n <= 1:
+        return run_sequential()
+
+    if on_gpu:
+        workers = gpu_worker_count()
+        if workers <= 1:
+            return run_sequential()
+        try:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [pool.submit(work, i, f) for i, f in enumerate(source_files)]
+                for fut in as_completed(futures):
+                    idx, result, exc = fut.result()
+                    consume(idx, result, exc)
+            if first_error:
+                raise first_error[0]
+            return list(sess["transcriptions"])
+        except Exception as exc:
+            if first_error:
+                raise first_error[0]
+            app.logger.warning(
+                "GPU pool path failed (%s); falling back to sequential.", exc
+            )
+            with sess["lock"]:
+                sess["transcriptions"] = []
+                sess["transcription_status"]["completed"] = 0
+            for i in range(n):
+                slots[i] = None
+            return run_sequential()
+
+    workers = cpu_worker_count(n)
+    if workers <= 1:
+        return run_sequential()
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(work, i, f) for i, f in enumerate(source_files)]
+            for fut in as_completed(futures):
+                idx, result, exc = fut.result()
+                consume(idx, result, exc)
+        if first_error:
+            raise first_error[0]
+        return list(sess["transcriptions"])
+    except Exception as exc:
+        if first_error:
+            raise first_error[0]
+        app.logger.warning(
+            "CPU transcription pool failed (%s); sequential fallback.", exc
+        )
+        with sess["lock"]:
+            sess["transcriptions"] = []
+            sess["transcription_status"]["completed"] = 0
+        for i in range(n):
+            slots[i] = None
+        return run_sequential()
 
 
 # --------------------------------------------------------------------------
@@ -486,10 +864,162 @@ def media_source(sid):
 # routes — API
 # --------------------------------------------------------------------------
 
+@app.route("/api/session/reset", methods=["POST"])
+def api_session_reset():
+    """Start a clean workspace — drops any leftover audio from prior use."""
+    global ACTIVE_SID
+    with _SESS_LOCK:
+        old = ACTIVE_SID
+        old_sess = SESSIONS.get(old) if old else None
+        if old_sess:
+            with old_sess["lock"]:
+                if old_sess["transcription_status"]["state"] == "running":
+                    return jsonify(error="Wait for the current transcription to finish before resetting."), 409
+        if old and old in SESSIONS:
+            old_sess = SESSIONS.pop(old)
+            try:
+                if os.path.isdir(old_sess["dir"]):
+                    shutil.rmtree(old_sess["dir"], ignore_errors=True)
+            except Exception:
+                pass
+        # Also sweep any orphan dirs left behind.
+        if os.path.isdir(BASE_DIR):
+            for name in os.listdir(BASE_DIR):
+                path = os.path.join(BASE_DIR, name)
+                if os.path.isdir(path) and name not in SESSIONS:
+                    shutil.rmtree(path, ignore_errors=True)
+        ACTIVE_SID = uuid4().hex
+        sess = _new_session_dict(ACTIVE_SID)
+        SESSIONS[ACTIVE_SID] = sess
+        return jsonify(ok=True, sid=ACTIVE_SID, files=[], file_count=0)
+
+
+@app.route("/api/files", methods=["GET"])
+def api_list_files():
+    sid = get_sid_or_none()
+    sess = get_session(sid) if sid else None
+    if not sess:
+        return jsonify(files=[], file_count=0, multifile=False)
+    return jsonify(files_payload(sess, sid))
+
+
+@app.route("/api/files", methods=["DELETE"])
+def api_clear_files():
+    sid = get_sid_or_none()
+    sess = get_session(sid) if sid else None
+    if not sess:
+        return jsonify(error="No session."), 400
+    with sess["lock"]:
+        if sess["transcription_status"]["state"] == "running":
+            return jsonify(error="Wait for the current transcription to finish before changing files."), 409
+        failed_removals = clear_file_pool(sess)
+        if failed_removals:
+            return jsonify(
+                error=f"Could not remove {failed_removals} media file(s). The list was kept; retry after checking file permissions."
+            ), 500
+        return jsonify(files_payload(sess, sid))
+
+
+@app.route("/api/files/<file_id>", methods=["DELETE"])
+def api_delete_file(file_id):
+    sid = get_sid_or_none()
+    sess = get_session(sid) if sid else None
+    if not sess:
+        return jsonify(error="No session."), 400
+    with sess["lock"]:
+        if sess["transcription_status"]["state"] == "running":
+            return jsonify(error="Wait for the current transcription to finish before changing files."), 409
+
+        keep, drop = [], []
+        for f in sess["source_files"]:
+            (drop if f.get("id") == file_id else keep).append(f)
+        if not drop:
+            return jsonify(error="File not found."), 404
+
+        for f in drop:
+            try:
+                os.remove(f["path"])
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                app.logger.warning("Could not remove media file %s", f["path"], exc_info=True)
+                return jsonify(error=f"Could not remove file: {exc}"), 500
+
+        sess["source_files"] = keep
+        sess["chunks"] = []
+        sess["transcriptions"] = []
+        sess["transcript"] = None
+        sess["segments"] = []
+        sess["transcription_status"] = _empty_transcription_status()
+        sync_primary_source(sess)
+        return jsonify(files_payload(sess, sid))
+
+
+@app.route("/api/files/<file_id>/rename", methods=["POST"])
+def api_rename_file(file_id):
+    sid = get_sid_or_none()
+    sess = get_session(sid) if sid else None
+    if not sess:
+        return jsonify(error="No session."), 400
+    with sess["lock"]:
+        if sess["transcription_status"]["state"] == "running":
+            return jsonify(error="Wait for the current transcription to finish before changing files."), 409
+
+        data = request.get_json(force=True, silent=True) or {}
+        name = data.get("name")
+        if not isinstance(name, str):
+            return jsonify(error="Provide a file name."), 400
+        name = secure_filename(name.strip())
+        if not name:
+            return jsonify(error="Provide a valid file name."), 400
+
+        source_file = next((f for f in sess["source_files"] if f.get("id") == file_id), None)
+        if source_file is None:
+            return jsonify(error="File not found."), 404
+        if not os.path.splitext(name)[1]:
+            name += source_file.get("ext") or ""
+        source_file["name"] = name
+        sess["transcriptions"] = []
+        sess["transcript"] = None
+        sess["segments"] = []
+        sess["transcription_status"] = _empty_transcription_status()
+        return jsonify(files_payload(sess, sid))
+
+
+@app.route("/api/files/reorder", methods=["POST"])
+def api_reorder_files():
+    sid = get_sid_or_none()
+    sess = get_session(sid) if sid else None
+    if not sess:
+        return jsonify(error="No session."), 400
+    with sess["lock"]:
+        if sess["transcription_status"]["state"] == "running":
+            return jsonify(error="Wait for the current transcription to finish before changing files."), 409
+
+        data = request.get_json(force=True, silent=True) or {}
+        order = data.get("order")
+        if not isinstance(order, list) or not order:
+            return jsonify(error="Provide an 'order' list of file ids."), 400
+
+        by_id = {f["id"]: f for f in sess["source_files"]}
+        if (not all(isinstance(file_id, str) for file_id in order)
+                or set(order) != set(by_id.keys()) or len(order) != len(by_id)):
+            return jsonify(error="Order must list each current file id exactly once."), 400
+
+        sess["source_files"] = [by_id[i] for i in order]
+        sess["transcriptions"] = []
+        sess["transcript"] = None
+        sess["segments"] = []
+        sess["transcription_status"] = _empty_transcription_status()
+        sync_primary_source(sess)
+        return jsonify(files_payload(sess, sid))
+
+
 @app.route("/api/load", methods=["POST"])
-def api_load():
-    sid = ensure_sid()
-    sess = get_session(sid, create=True)
+@serialize_current_session
+def api_load(_session=None, _sid=None):
+    sid = _sid or ensure_sid()
+    sess = _session or get_session(sid, create=True)
     if sess["transcription_status"]["state"] == "running":
         return jsonify(error="Wait for the current transcription to finish before adding files."), 409
 
@@ -506,75 +1036,61 @@ def api_load():
         files_dir = os.path.join(sess["dir"], "sources")
         os.makedirs(files_dir, exist_ok=True)
 
-        loaded = []
+        # Save uploads first (I/O), then probe in parallel on CPU.
+        saved = []
         start_index = len(sess["source_files"])
         for i, up in enumerate(up_list, start=start_index):
             ext = os.path.splitext(secure_filename(up.filename))[1].lower() or ".mp4"
-            src_path = os.path.join(files_dir, f"{i:04d}_{uuid4().hex}_source{ext}")
+            file_id = uuid4().hex
+            src_path = os.path.join(files_dir, f"{i:04d}_{file_id}_source{ext}")
             up.save(src_path)
-
-            info = probe_media(src_path)
-            if info is None:
-                try:
-                    os.remove(src_path)
-                except OSError:
-                    pass
-                continue
-
-            loaded.append({
+            saved.append({
+                "id": file_id,
                 "path": src_path,
                 "name": secure_filename(up.filename) or f"file_{i}{ext}",
                 "ext": ext,
+            })
+
+        def _probe_one(meta):
+            info = probe_media(meta["path"])
+            if info is None:
+                try:
+                    os.remove(meta["path"])
+                except OSError:
+                    pass
+                return None
+            return {
+                "id": meta["id"],
+                "path": meta["path"],
+                "name": meta["name"],
+                "ext": meta["ext"],
                 "kind": info["kind"],
                 "duration": info["duration"],
                 "file_size": info["file_size"],
                 "format": info["format"],
                 "video_info": info["video_info"],
                 "audio_info": info["audio_info"],
-            })
+            }
+
+        probed = run_cpu_jobs([lambda m=m: _probe_one(m) for m in saved])
+        loaded = [p for p in probed if p is not None]
 
         if not loaded:
             return jsonify(error="None of the newly uploaded files could be read as media."), 400
 
         sess["source_files"].extend(loaded)
-        sess["multifile"] = len(sess["source_files"]) > 1
         sess["transcriptions"] = []
-        sess["transcription_status"] = {
-            "state": "idle", "completed": 0, "total": 0, "error": None,
-        }
+        sess["transcription_status"] = _empty_transcription_status()
+        # Clear chunks — they belong to the previous primary source.
+        for c in sess.get("chunks") or []:
+            try:
+                os.remove(c["path"])
+            except OSError:
+                pass
+        sess["chunks"] = []
+        sync_primary_source(sess)
 
-        first = sess["source_files"][0]
-        sess["source"] = {
-            "path": first["path"],
-            "ext": first["ext"],
-            "kind": first["kind"],
-            "duration": first["duration"],
-            "file_size": first["file_size"],
-            "format": first["format"],
-            "video_info": first["video_info"],
-            "audio_info": first["audio_info"],
-        }
-
-        return jsonify(
-            kind=first["kind"],
-            duration=first["duration"],
-            src=f"/media/{sid}/source",
-            file_size=first["file_size"],
-            format=first["format"],
-            video_info=first["video_info"],
-            audio_info=first["audio_info"],
-            multifile=sess["multifile"],
-            file_count=len(sess["source_files"]),
-            files=[
-                {
-                    "name": f["name"],
-                    "kind": f["kind"],
-                    "duration": f["duration"],
-                    "file_size": f["file_size"],
-                }
-                for f in sess["source_files"]
-            ],
-        )
+        return jsonify(**files_payload(sess, sid))
 
     if url:
         # ---- URL path: always single-file, multifile=False ----
@@ -624,17 +1140,9 @@ def api_load():
         if info is None:
             return jsonify(error="That file doesn't look like a media file ffmpeg can read."), 400
 
-        sess["source"] = {
-            "path": src_path,
-            "ext": os.path.splitext(src_path)[1],
-            "kind": info["kind"],
-            "duration": info["duration"],
-            "file_size": info["file_size"],
-            "format": info["format"],
-            "video_info": info["video_info"],
-            "audio_info": info["audio_info"],
-        }
+        file_id = uuid4().hex
         sess["source_files"] = [{
+            "id": file_id,
             "path": src_path,
             "name": os.path.basename(src_path),
             "ext": os.path.splitext(src_path)[1],
@@ -645,25 +1153,11 @@ def api_load():
             "video_info": info["video_info"],
             "audio_info": info["audio_info"],
         }]
-        sess["multifile"] = False
+        sess["transcriptions"] = []
+        sess["transcription_status"] = _empty_transcription_status()
+        sync_primary_source(sess)
 
-        return jsonify(
-            kind=info["kind"],
-            duration=info["duration"],
-            src=f"/media/{sid}/source",
-            file_size=info["file_size"],
-            format=info["format"],
-            video_info=info["video_info"],
-            audio_info=info["audio_info"],
-            multifile=False,
-            file_count=1,
-            files=[{
-                "name": os.path.basename(src_path),
-                "kind": info["kind"],
-                "duration": info["duration"],
-                "file_size": info["file_size"],
-            }],
-        )
+        return jsonify(**files_payload(sess, sid))
 
     return jsonify(error="Provide a file or a URL."), 400
 
@@ -821,7 +1315,7 @@ def download_all_chunks():
 def api_transcribe():
     sid = get_sid_or_none()
     sess = get_session(sid) if sid else None
-    if not sess or not sess.get("source"):
+    if not sess:
         return jsonify(error="Load a media file first."), 400
 
     d = request.get_json(force=True, silent=True) or {}
@@ -835,77 +1329,41 @@ def api_transcribe():
     api_key = d.get("api_key")
     num_speakers = d.get("num_speakers")
 
-    # ---- multi-file path: one transcription per source file, NOT concatenated ----
-    if sess.get("multifile"):
+    with sess["lock"]:
+        if not sess.get("source"):
+            return jsonify(error="Load a media file first."), 400
         if sess["transcription_status"]["state"] == "running":
             return jsonify(error="A transcription is already running for this session."), 409
-        results = []
         source_files = list(sess["source_files"])
-        sess["transcriptions"] = results
+        is_multifile = sess.get("multifile")
+        sess["transcriptions"] = []
         sess["transcript"] = None
         sess["transcription_status"] = {
-            "state": "running", "completed": 0, "total": len(source_files), "error": None,
+            "state": "running", "completed": 0,
+            "total": len(source_files) if is_multifile else 1, "error": None,
         }
+
+    # ---- multi-file path: one transcription per source file, NOT concatenated ----
+    if is_multifile:
         try:
-            for f in source_files:
-                segs = transcribe_file(
-                    f["path"], engine, language, device, model_size,
-                    hf_token=api_key, diarize=False,
-                )
-                # ensure segment dicts are JSON-safe and have consistent keys
-                norm_segs = []
-                for s in segs:
-                    seg = {
-                        "start": float(s.get("start", 0.0)),
-                        "end": float(s.get("end", 0.0)),
-                        "text": (s.get("text") or "").strip(),
-                    }
-                    if s.get("speaker"):
-                        seg["speaker"] = s["speaker"]
-                    norm_segs.append(seg)
-
-                # diarization for non-MLX engines (per file)
-                if diarize and not any(s.get("speaker") for s in norm_segs):
-                    if diarize_method == "pyannote":
-                        turns = run_pyannote(f["path"], api_key, num_speakers)
-                        assign_speakers_from_turns(norm_segs, turns)
-                    elif diarize_method == "ai_api":
-                        labels = run_ai_diarization(norm_segs, ai_provider, api_key, num_speakers)
-                        for seg, label in zip(norm_segs, labels):
-                            seg["speaker"] = label
-                    else:
-                        sess["transcription_status"].update(
-                            state="failed", error="Choose a diarization method (pyannote or AI API)."
-                        )
-                        return jsonify(error="Choose a diarization method (pyannote or AI API)."), 400
-
-                lines = []
-                for seg in norm_segs:
-                    prefix = f"{seg['speaker']}: " if seg.get("speaker") else ""
-                    lines.append(f"[{fmt_ts(seg['start'])} - {fmt_ts(seg['end'])}] {prefix}{seg['text']}")
-                text = "\n".join(lines)
-
-                results.append({
-                    "name": f["name"],
-                    "transcript": text,
-                    "segments": norm_segs,
-                })
-                sess["transcriptions"] = list(results)
-                sess["transcript"] = "\n\n".join(
-                    f"===== {r['name']} =====\n{r['transcript']}" for r in results
-                )
-                sess["transcription_status"]["completed"] = len(results)
+            results = run_multifile_transcriptions(
+                sess, source_files, engine, language, device, model_size,
+                diarize, diarize_method, ai_provider, api_key, num_speakers,
+            )
         except RuntimeError as e:
-            sess["transcription_status"].update(state="failed", error=str(e))
+            with sess["lock"]:
+                sess["transcription_status"].update(state="failed", error=str(e))
             return jsonify(error=str(e)), 500
         except Exception as e:
-            sess["transcription_status"].update(
-                state="failed", error=f"Transcription failed: {e}"
-            )
+            with sess["lock"]:
+                sess["transcription_status"].update(
+                    state="failed", error=f"Transcription failed: {e}"
+                )
             return jsonify(error=f"Transcription failed: {e}"), 500
 
-        sess["segments"] = []  # no combined segments in multi-file mode
-        sess["transcription_status"]["state"] = "complete"
+        with sess["lock"]:
+            sess["segments"] = []  # no combined segments in multi-file mode
+            sess["transcription_status"]["state"] = "complete"
 
         return jsonify(
             multifile=True,
@@ -917,70 +1375,114 @@ def api_transcribe():
             segments=[],
         )
 
-    # ---- single-file path (unchanged behavior) ----
+    # ---- single-file path (unchanged behavior, with CPU-parallel chunks) ----
     sources = sess["chunks"] if sess["chunks"] else [{
         "start": 0.0, "path": sess["source"]["path"],
     }]
     sources = sorted(sources, key=lambda c: c.get("start", 0.0))
 
-    all_segments = []
+    def _transcribe_item(item):
+        if engine == "mlx" and diarize:
+            segs = transcribe_file(
+                item["path"], engine, language, device, model_size,
+                hf_token=api_key, diarize=True
+            )
+        else:
+            segs = transcribe_file(
+                item["path"], engine, language, device, model_size
+            )
+        offset = item.get("start", 0.0)
+        out = []
+        for s in segs:
+            segment = {
+                "start": s["start"] + offset,
+                "end": s["end"] + offset,
+                "text": s["text"],
+            }
+            if s.get("speaker"):
+                segment["speaker"] = s["speaker"]
+            out.append(segment)
+        return out
+
     try:
-        for item in sources:
-            if engine == "mlx" and diarize:
-                segs = transcribe_file(
-                    item["path"], engine, language, device, model_size,
-                    hf_token=api_key, diarize=True
-                )
-            else:
-                segs = transcribe_file(
-                    item["path"], engine, language, device, model_size
-                )
-
-            offset = item.get("start", 0.0)
-            for s in segs:
-                segment = {"start": s["start"] + offset, "end": s["end"] + offset, "text": s["text"]}
-                if s.get("speaker"):
-                    segment["speaker"] = s["speaker"]
-                all_segments.append(segment)
-
+        if uses_gpu_device(engine, device) or force_sequential() or len(sources) <= 1:
+            piece_lists = [_transcribe_item(item) for item in sources]
+        else:
+            piece_lists = run_cpu_jobs(
+                [lambda item=item: _transcribe_item(item) for item in sources]
+            )
+        all_segments = []
+        for pieces in piece_lists:
+            all_segments.extend(pieces)
     except RuntimeError as e:
+        with sess["lock"]:
+            sess["transcription_status"].update(state="failed", error=str(e))
         return jsonify(error=str(e)), 500
     except Exception as e:
+        with sess["lock"]:
+            sess["transcription_status"].update(
+                state="failed", error=f"Transcription failed: {e}"
+            )
         return jsonify(error=f"Transcription failed: {e}"), 500
 
     # Handle diarization for non-MLX engines or when MLX didn't provide speakers
     if diarize and not any(s.get("speaker") for s in all_segments):
         try:
             if diarize_method == "pyannote":
-                turns = []
-                for item in sources:
+                def _diarize_item(item):
                     t = run_pyannote(item["path"], api_key, num_speakers)
                     off = item.get("start", 0.0)
-                    for x in t:
-                        turns.append({"start": x["start"] + off, "end": x["end"] + off, "speaker": x["speaker"]})
+                    return [
+                        {"start": x["start"] + off, "end": x["end"] + off, "speaker": x["speaker"]}
+                        for x in t
+                    ]
+
+                if force_sequential() or len(sources) <= 1:
+                    turn_lists = [_diarize_item(item) for item in sources]
+                else:
+                    # pyannote is GPU-heavy on many setups — serialize by default,
+                    # but allow CPU-side pipeline overlap via DIARIX_CPU_WORKERS
+                    # only when device is cpu; otherwise sequential.
+                    if uses_gpu_device(engine, device) or (device or "").lower() != "cpu":
+                        turn_lists = [_diarize_item(item) for item in sources]
+                    else:
+                        turn_lists = run_cpu_jobs(
+                            [lambda item=item: _diarize_item(item) for item in sources]
+                        )
+                turns = []
+                for tl in turn_lists:
+                    turns.extend(tl)
                 assign_speakers_from_turns(all_segments, turns)
             elif diarize_method == "ai_api":
                 labels = run_ai_diarization(all_segments, ai_provider, api_key, num_speakers)
                 for seg, label in zip(all_segments, labels):
                     seg["speaker"] = label
             else:
+                with sess["lock"]:
+                    sess["transcription_status"].update(
+                        state="failed", error="Choose a diarization method (pyannote or AI API)."
+                    )
                 return jsonify(error="Choose a diarization method (pyannote or AI API)."), 400
 
         except RuntimeError as e:
             app.logger.exception("Diarization failed")
+            with sess["lock"]:
+                sess["transcription_status"].update(state="failed", error=str(e))
             return jsonify(error=str(e)), 500
         except Exception as e:
             app.logger.exception("Diarization failed")
+            with sess["lock"]:
+                sess["transcription_status"].update(
+                    state="failed", error=f"Diarization failed: {e}"
+                )
             return jsonify(error=f"Diarization failed: {e}"), 500
 
-    lines = []
-    for seg in all_segments:
-        prefix = f"{seg['speaker']}: " if seg.get("speaker") else ""
-        lines.append(f"[{fmt_ts(seg['start'])} - {fmt_ts(seg['end'])}] {prefix}{seg['text']}")
-    transcript = "\n".join(lines)
+    transcript = segments_to_transcript(all_segments)
     sess["transcript"] = transcript
     sess["segments"] = all_segments
     sess["transcriptions"] = []
+    with sess["lock"]:
+        sess["transcription_status"].update(state="complete", completed=1)
     return jsonify(transcript=transcript, segments=all_segments)
 
 
@@ -990,10 +1492,11 @@ def api_transcribe_status():
     sess = get_session(sid) if sid else None
     if not sess:
         return jsonify(error="No transcription session found."), 404
-    transcriptions = sess.get("transcriptions") or []
-    status = dict(sess["transcription_status"])
-    if status["state"] == "running":
-        status["completed"] = len(transcriptions)
+    with sess["lock"]:
+        transcriptions = list(sess.get("transcriptions") or [])
+        status = dict(sess["transcription_status"])
+        if status["state"] == "running":
+            status["completed"] = len(transcriptions)
     return jsonify(
         status=status,
         transcriptions=transcriptions,
@@ -1055,6 +1558,27 @@ def download_transcription_indexed(idx):
         abort(404)
     item = transcriptions[idx]
     base = os.path.splitext(item.get("name", f"transcription_{idx}"))[0] or f"transcription_{idx}"
+    fname = f"{base}.txt"
+    buf = io.BytesIO(item["transcript"].encode("utf-8"))
+    buf.seek(0)
+    return send_file(buf, as_attachment=True, download_name=fname, mimetype="text/plain")
+
+
+@app.route("/api/download/transcription/file/<file_id>")
+def download_transcription_file(file_id):
+    """Download a per-file transcript by stable source id while results arrive."""
+    sid = get_sid_or_none()
+    sess = get_session(sid) if sid else None
+    if not sess:
+        abort(404)
+    item = next(
+        (result for result in sess.get("transcriptions", [])
+         if result.get("id") == file_id),
+        None,
+    )
+    if item is None:
+        abort(404)
+    base = os.path.splitext(item.get("name", "transcription"))[0] or "transcription"
     fname = f"{base}.txt"
     buf = io.BytesIO(item["transcript"].encode("utf-8"))
     buf.seek(0)
@@ -1259,6 +1783,29 @@ legend{font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:var
   font-size:11px; color:var(--text-faint);
 }
 
+/* --- upload file pool --- */
+.file-pool{
+  display:flex; flex-direction:column; gap:8px;
+  background:var(--panel-2); border:1px solid var(--border); border-radius:8px; padding:12px 14px;
+}
+.file-pool .pool-title{
+  font-family:var(--font-display); font-weight:600; font-size:13.5px; color:var(--amber);
+}
+.file-pool .pool-header{display:flex; align-items:center; justify-content:space-between; gap:10px;}
+ul#filePoolList{list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:8px;}
+ul#filePoolList li{
+  display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap;
+  background:var(--panel); border:1px solid var(--border); border-radius:7px; padding:9px 12px;
+  font-size:12.5px;
+}
+ul#filePoolList li .fname{
+  font-family:var(--font-mono); color:var(--text); word-break:break-all; flex:1;
+}
+ul#filePoolList li .fmeta{color:var(--text-dim); font-family:var(--font-mono); font-size:11.5px; white-space:nowrap;}
+ul#filePoolList li .pool-actions{display:flex; gap:6px; flex-wrap:wrap;}
+ul#filePoolList li .pool-rename{display:flex; gap:6px; flex:1 1 220px; min-width:180px;}
+ul#filePoolList li .pool-rename input{min-width:0; flex:1; padding:6px 8px; font-size:12px;}
+
 /* --- preview & cut --- */
 .preview-wrap{background:#000; border:1px solid var(--border); border-radius:9px; overflow:hidden; max-height:38vh; display:flex; align-items:center; justify-content:center;}
 video, audio{width:100%; display:block;}
@@ -1399,6 +1946,17 @@ footer{flex:0 0 auto; padding:9px 22px; text-align:center; font-size:11px; color
         </div>
 
         <div><button class="btn" id="loadBtn">Add files</button></div>
+
+        <!-- Upload pool: add / reorder / delete before transcription -->
+        <div id="filePool" class="file-pool hidden">
+          <div class="pool-header">
+            <div class="pool-title">Audio / video pool <span id="filePoolCount" style="color:var(--text-dim); font-weight:500; font-size:12px;"></span></div>
+            <button class="btn danger small" id="clearFilesBtn" type="button">Wipe list</button>
+          </div>
+          <div class="empty-note" id="filePoolEmpty">No files yet — choose one or more files above.</div>
+          <ul id="filePoolList"></ul>
+          <div class="empty-note">Transcription order follows this list. Rename or remove files, or use ↑ / ↓ to reorder.</div>
+        </div>
 
         <!-- Media info panel -->
         <div id="mediaInfoPanel" class="media-info-panel hidden">
@@ -1744,7 +2302,7 @@ function displayMediaInfo(data){
 
   const items = [];
 
-  if (data.multifile) {
+  if (data.file_count > 1) {
     items.push({label: 'Files', value: String(data.file_count)});
   }
   items.push({label: 'Type', value: data.kind === 'video' ? 'Video' : 'Audio'});
@@ -1775,13 +2333,173 @@ function displayMediaInfo(data){
     `;
     mediaInfoGrid.appendChild(div);
   });
+}
 
-  if (data.multifile && data.files) {
-    const listWrap = document.createElement('div');
-    listWrap.style.gridColumn = '1 / -1';
-    listWrap.innerHTML = '<span class="info-label">Loaded files</span>' +
-      data.files.map(f => `<div class="info-value">${f.name} — ${fmtTs(f.duration)}</div>`).join('');
-    mediaInfoGrid.appendChild(listWrap);
+function applyLoadedFiles(data){
+  state.kind = data.kind;
+  state.duration = data.duration || 0;
+  state.chunks = [];
+  state.multifile = !!data.multifile;
+  state.fileCount = data.file_count || 0;
+  state.files = data.files || [];
+  state.transcriptions = [];
+
+  renderFilePool();
+
+  if (!state.files.length) {
+    mediaInfoPanel.classList.add('hidden');
+    document.querySelector('.tab-btn[data-tab="cut"]').disabled = true;
+    document.querySelector('.tab-btn[data-tab="transcribe"]').disabled = true;
+    document.querySelector('.tab-btn[data-tab="extract"]').disabled = true;
+    clearResultsUI();
+    return;
+  }
+
+  if (data.src) setupPreviewElement(data.kind, data.src);
+  resetCutUI();
+  renderChunkList();
+  displayMediaInfo(data);
+  applyMultifileMode(state.multifile);
+  clearResultsUI();
+  unlockTabs();
+}
+
+function renderFilePool(){
+  const pool = document.getElementById('filePool');
+  const list = document.getElementById('filePoolList');
+  const empty = document.getElementById('filePoolEmpty');
+  const count = document.getElementById('filePoolCount');
+  const files = state.files || [];
+
+  pool.classList.toggle('hidden', files.length === 0 && modeUrl.classList.contains('active'));
+  if (modeUpload.classList.contains('active')) pool.classList.remove('hidden');
+
+  count.textContent = files.length ? `(${files.length})` : '';
+  empty.classList.toggle('hidden', files.length > 0);
+  list.innerHTML = '';
+
+  files.forEach((f, idx)=>{
+    const li = document.createElement('li');
+    li.dataset.id = f.id;
+
+    const left = document.createElement('div');
+    left.style.cssText = 'display:flex; flex-direction:column; gap:2px; flex:1; min-width:0;';
+    const fileName = document.createElement('span');
+    fileName.className = 'fname';
+    fileName.textContent = `${idx+1}. ${f.name}`;
+    const fileMeta = document.createElement('span');
+    fileMeta.className = 'fmeta';
+    fileMeta.textContent = `${f.kind || ''} · ${fmtTs(f.duration || 0)} · ${formatBytes(f.file_size || 0)}`;
+    left.appendChild(fileName);
+    left.appendChild(fileMeta);
+
+    const rename = document.createElement('form');
+    rename.className = 'pool-rename';
+    const nameInput = document.createElement('input');
+    nameInput.type = 'text';
+    nameInput.value = f.name;
+    nameInput.setAttribute('aria-label', `New name for ${f.name}`);
+    nameInput.maxLength = 255;
+    const renameBtn = document.createElement('button');
+    renameBtn.className = 'btn secondary small';
+    renameBtn.type = 'submit';
+    renameBtn.textContent = 'Rename';
+    rename.addEventListener('submit', event => {
+      event.preventDefault();
+      renameFile(f.id, nameInput.value);
+    });
+    rename.appendChild(nameInput);
+    rename.appendChild(renameBtn);
+
+    const actions = document.createElement('div');
+    actions.className = 'pool-actions';
+
+    const upBtn = document.createElement('button');
+    upBtn.className = 'btn secondary small';
+    upBtn.textContent = '↑';
+    upBtn.title = 'Move up';
+    upBtn.disabled = idx === 0;
+    upBtn.addEventListener('click', ()=>reorderFile(idx, idx-1));
+
+    const downBtn = document.createElement('button');
+    downBtn.className = 'btn secondary small';
+    downBtn.textContent = '↓';
+    downBtn.title = 'Move down';
+    downBtn.disabled = idx === files.length - 1;
+    downBtn.addEventListener('click', ()=>reorderFile(idx, idx+1));
+
+    const delBtn = document.createElement('button');
+    delBtn.className = 'btn danger small';
+    delBtn.textContent = 'Remove';
+    delBtn.addEventListener('click', ()=>deleteFile(f.id));
+
+    actions.appendChild(upBtn);
+    actions.appendChild(downBtn);
+    actions.appendChild(delBtn);
+    li.appendChild(left);
+    li.appendChild(rename);
+    li.appendChild(actions);
+    list.appendChild(li);
+  });
+}
+
+async function renameFile(fileId, name){
+  try{
+    const data = await api(`/api/files/${encodeURIComponent(fileId)}/rename`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({name}),
+    });
+    applyLoadedFiles(data);
+  }catch(e){ toast(e.message); }
+}
+
+async function reorderFile(fromIdx, toIdx){
+  const files = state.files.slice();
+  if (toIdx < 0 || toIdx >= files.length) return;
+  const [item] = files.splice(fromIdx, 1);
+  files.splice(toIdx, 0, item);
+  const order = files.map(f => f.id);
+  try{
+    const data = await api('/api/files/reorder', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({order}),
+    });
+    applyLoadedFiles(data);
+  }catch(e){ toast(e.message); }
+}
+
+async function deleteFile(fileId){
+  try{
+    const data = await api(`/api/files/${encodeURIComponent(fileId)}`, {method:'DELETE'});
+    applyLoadedFiles(data);
+  }catch(e){ toast(e.message); }
+}
+
+document.getElementById('clearFilesBtn').addEventListener('click', async ()=>{
+  if (!state.files.length || !window.confirm('Wipe all files from the upload list?')) return;
+  try{
+    const data = await api('/api/files', {method:'DELETE'});
+    applyLoadedFiles(data);
+    goTab('load');
+  }catch(e){ toast(e.message); }
+});
+
+async function resetWorkspace(){
+  try{
+    await api('/api/session/reset', {method:'POST'});
+    state.kind = null;
+    state.duration = 0;
+    state.chunks = [];
+    state.segments = [];
+    state.multifile = false;
+    state.fileCount = 0;
+    state.files = [];
+    state.transcriptions = [];
+    renderFilePool();
+    mediaInfoPanel.classList.add('hidden');
+    clearResultsUI();
+  }catch(e){
+    toast('Could not reset workspace: ' + e.message);
   }
 }
 
@@ -1809,30 +2527,20 @@ document.getElementById('loadBtn').addEventListener('click', async ()=>{
   btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Loading…';
   try{
     const data = await api('/api/load', {method:'POST', body: fd});
-    state.kind = data.kind;
-    state.duration = data.duration;
-    state.chunks = [];
     state.selectedFormat = null;
-    state.multifile = !!data.multifile;
-    state.fileCount = data.file_count || 1;
-    state.files = data.files || [];
-    state.transcriptions = [];
-
-    setupPreviewElement(data.kind, data.src);
-    resetCutUI();
-    renderChunkList();
-    displayMediaInfo(data);
-    applyMultifileMode(state.multifile);
-    clearResultsUI();
-    unlockTabs();
+    applyLoadedFiles(data);
+    document.getElementById('fileInput').value = '';
     if (state.multifile) {
       goTab('transcribe');
-    } else {
+    } else if (state.files.length) {
       goTab('cut');
     }
   }catch(e){ toast(e.message); }
   finally{ btn.disabled = false; btn.textContent = modeUpload.classList.contains('active') ? 'Add files' : 'Load from URL'; }
 });
+
+// Wipe leftover audio from any previous browser/server session on first paint.
+resetWorkspace();
 
 function applyMultifileMode(isMulti){
   const cutBtn = document.querySelector('.tab-btn[data-tab="cut"]');
@@ -2164,7 +2872,9 @@ function renderMultiTranscriptions(items, status){
     dlBtn.textContent = 'Download';
     dlBtn.title = 'Download this transcription';
     dlBtn.addEventListener('click', ()=>{
-      window.location.href = `/api/download/transcription/${idx}`;
+      window.location.href = item.id
+        ? `/api/download/transcription/file/${encodeURIComponent(item.id)}`
+        : `/api/download/transcription/${idx}`;
     });
 
     header.appendChild(nameEl);
@@ -2271,4 +2981,5 @@ document.getElementById('downloadZipBtnMulti').addEventListener('click', ()=>{
 """
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5030)
+    # threaded=True so status polling works while a transcription request runs.
+    app.run(debug=True, host="0.0.0.0", port=5030, threaded=True)
