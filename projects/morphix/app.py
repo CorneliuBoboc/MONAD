@@ -978,7 +978,7 @@ def call_gemini_pdf_sections(api_key, filename, pdf_bytes):
             ],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                temperature=0.1,
+                temperature=0.0,
             ),
         )
         text = resp.text or ""
