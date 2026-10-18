@@ -41,9 +41,12 @@ import requests
 # starts (and other formats still work) if one library isn't installed.
 # ---------------------------------------------------------------------------
 try:
-    import PyMuPDF
+    import pymupdf as fitz
 except ImportError:
-    fitz = None
+    try:
+        import fitz
+    except ImportError:
+        fitz = None
 
 try:
     from pypdf import PdfReader, PdfWriter
@@ -861,28 +864,13 @@ def split_document(src_path, ext, ranges, target_ext, out_dir):
 # ---- AI helpers -----------------------------------------------------------
 
 SPLIT_SYSTEM_PROMPT = (
-"""You are analyzing a PDF document. Identify every top-level section that should become its own standalone PDF.
+"""You are analyzing a document. Identify every top-level section that should become its own standalone part.
 
 CRITICAL: Do NOT group all front matter into one section, and do NOT group all back matter into one. Each distinct front-matter or back-matter item must be its OWN section with its OWN filename. Examples of separate front-matter sections: cover, copyright page, dedication, table of contents, foreword, preface, acknowledgements. Examples of separate back-matter sections: appendix A, appendix B, glossary, bibliography, index, colophon, about the author.
 
 For proper chapters, use the chapter NUMBER shown in the document (not a running index).
 
-Return STRICT JSON, no prose, matching this schema:
-{
-  "sections": [
-    {
-      "title": "Human readable title as it appears in the document",
-      "number": 7,              // printed chapter number if any, else null
-      "kind": "frontmatter" | "chapter" | "backmatter",
-      "start_page": 12,         // 1-based, inclusive
-      "end_page": 34,           // 1-based, inclusive
-      "filename": "07_The_Chapter_Title"   // no extension; safe chars; zero-pad number to 2 digits when present
-    }
-  ]
-}
-
-Rules:
-- Sections must be contiguous and cover the document in order.
+Follow the output schema and coordinate convention in the request. For PDFs, use only the zero-based physical PDF page indices supplied in the outline; index 0 is the first physical page. Ignore printed page numbers, folios, Roman numerals, and contents-page references. Return the physical index of the first page of each section, not an end-page value.
 - Every distinct front/back-matter item is its own section (e.g. "00_cover", "00_copyright", "00_toc", "00_foreword", "99_glossary", "99_index").
 - Front/back matter use number=null and filename prefixed with "00_" (front) or "99_" (back).
 - Filenames: ASCII letters/digits/underscore only, <=80 chars, no extension.
@@ -960,7 +948,7 @@ def call_ai(provider, key, model, system, prompt, max_tokens=4000):
     raise ValueError("Unknown AI provider.")
 
 
-def call_gemini_pdf_sections(api_key, filename, pdf_bytes):
+def call_gemini_pdf_sections(api_key, filename, pdf_bytes, prompt):
     if genai is None or types is None:
         raise RuntimeError("google-genai is required for PDF chapter detection. Install it with: pip install google-genai")
 
@@ -975,10 +963,11 @@ def call_gemini_pdf_sections(api_key, filename, pdf_bytes):
             contents=[
                 types.Part.from_uri(file_uri=uploaded.uri, mime_type="application/pdf"),
                 SPLIT_SYSTEM_PROMPT,
+                prompt,
             ],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                temperature=0.1,
+                temperature=0.0,
             ),
         )
         text = resp.text or ""
@@ -997,14 +986,41 @@ def truncate_text(s, n):
     return s[:n] + "\n...[truncated for length]", True
 
 
-def build_outline_units(blocks, ext):
+def truncate_outline_lines(lines, max_chars):
+    """Keep a uniformly sampled outline spanning the entire document."""
+    text = "\n".join(lines)
+    if len(text) <= max_chars:
+        return text, False
+
+    marker = "[Outline sampled evenly across the document due to length.]"
+    budget = max_chars - len(marker) - 1
+    if budget <= 0 or len(lines) < 2:
+        return truncate_text(text, max_chars)
+
+    count = min(len(lines), max(2, int(len(lines) * budget / max(1, len(text)))))
+    while count >= 2:
+        indexes = [
+            round(i * (len(lines) - 1) / (count - 1))
+            for i in range(count)
+        ]
+        sampled = "\n".join(lines[i] for i in indexes)
+        if len(sampled) <= budget:
+            return marker + "\n" + sampled, True
+        if count == 2:
+            break
+        count = max(2, min(count - 1, int(count * budget / len(sampled))))
+
+    return truncate_text(text, max_chars)
+
+
+def build_outline_units(blocks, ext, total_units=None):
     """Returns (outline_lines, total_units, unit_kind) where unit_kind is
     'page' (pdf), 'chapter' (epub), or 'block' (everything else)."""
     if ext == "pdf":
         pages = {}
         for b in blocks:
             pages.setdefault(b["page"], []).append(b)
-        total = (max(pages.keys()) + 1) if pages else 0
+        total = max((max(pages.keys()) + 1) if pages else 0, int(total_units or 0))
         lines = []
         for i in range(total):
             pblocks = pages.get(i, [])
@@ -1036,18 +1052,27 @@ def build_outline_units(blocks, ext):
 def build_split_prompt(outline_text, unit_kind, total_units, ext=None):
     if ext == "pdf":
         return (
-            "You are analyzing a PDF document. Identify every top-level section that should become its own standalone PDF.\n\n"
+            f"The PDF has {total_units} physical pages indexed from 0. "
+            "Identify every top-level section that should become its own standalone PDF.\n\n"
             "CRITICAL: Do NOT group all front matter into one section, and do NOT group all back matter into one. Each distinct front-matter or back-matter item must be its OWN section with its OWN filename. Examples of separate front-matter sections: cover, copyright page, dedication, table of contents, foreword, preface, acknowledgements. Examples of separate back-matter sections: appendix A, appendix B, glossary, bibliography, index, colophon, about the author.\n\n"
             "For proper chapters, use the chapter NUMBER shown in the document (not a running index).\n\n"
+            "BOUNDARY COORDINATES ARE ZERO-BASED PHYSICAL PDF PAGE INDICES, NOT PRINTED PAGE NUMBERS. "
+            "Use the bracketed index in the outline; [0] means the first PDF page. Ignore Roman-numeral "
+            "folios, printed page numbers, and page references in the contents. Copy the physical index "
+            "of each section's first page into start_page_index.\n\n"
             "Return STRICT JSON, no prose, matching this schema:\n"
-            '{\n  "sections": [\n    {\n      "title": "Human readable title as it appears in the document",\n      "number": 7,\n      "kind": "frontmatter" | "chapter" | "backmatter",\n      "start_page": 12,\n      "end_page": 34,\n      "filename": "07_The_Chapter_Title"\n    }\n  ]\n}\n\n'
+            '{\n  "sections": [\n    {\n      "title": "Human readable title as it appears in the document",\n      "number": 7,\n      "kind": "frontmatter" | "chapter" | "backmatter",\n      "start_page_index": 11,\n      "filename": "07_The_Chapter_Title"\n    }\n  ]\n}\n\n'
             "Rules:\n"
-            "- Sections must be contiguous and cover the document in order.\n"
+            "- start_page_index must be an integer from 0 to "
+            f"{total_units - 1} copied from the bracketed physical PDF page index.\n"
+            "- Starts must be strictly increasing and the first section must start at index 0. "
+            "Each section ends immediately before the next starts; the last ends on the final PDF page.\n"
             "- Every distinct front/back-matter item is its own section.\n"
             "- Front/back matter use number=null and filename prefixed with 00_ or 99_.\n"
             "- Filenames: ASCII letters/digits/underscore only, <=80 chars, no extension.\n"
             "- Do not invent content not present in the PDF.\n\n"
-            "Use the following document outline as context only. It is a compressed summary, not the full text.\n"
+            "Use this page-indexed outline with the attached PDF. The physical PDF page indices are authoritative "
+            "even when printed page numbers differ.\n"
             f"OUTLINE:\n{outline_text}"
         )
 
@@ -1063,7 +1088,7 @@ def build_split_prompt(outline_text, unit_kind, total_units, ext=None):
 
 
 def _coerce_start_unit(item, total_units):
-    for key in ("start_unit", "start", "start_index", "index"):
+    for key in ("start_page_index", "start_unit", "start", "start_index", "index"):
         if key not in item:
             continue
         try:
@@ -1088,7 +1113,7 @@ def _coerce_start_page(item, total_units):
     return None
 
 
-def parse_split_response(raw, total_units):
+def parse_split_response(raw, total_units, require_pdf_page_indexes=False):
     text = raw.strip()
     text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.S).strip()
     try:
@@ -1113,12 +1138,28 @@ def parse_split_response(raw, total_units):
         if not isinstance(item, dict):
             continue
 
-        start_page = _coerce_start_page(item, total_units)
+        has_page_index = False
+        page_index = None
+        if "start_page_index" in item:
+            try:
+                page_index = int(item["start_page_index"])
+                has_page_index = True
+            except (TypeError, ValueError):
+                if require_pdf_page_indexes:
+                    raise RuntimeError("The AI response did not contain a valid physical PDF page index.")
+        if require_pdf_page_indexes and not has_page_index:
+            raise RuntimeError("The AI response omitted a physical PDF page index.")
+        if require_pdf_page_indexes and not 0 <= page_index < total_units:
+            raise RuntimeError("The AI response contained a physical PDF page index outside the document.")
+
+        start_page = None if has_page_index else _coerce_start_page(item, total_units)
         start_unit = _coerce_start_unit(item, total_units)
         start_value = start_page if start_page is not None else start_unit
         if start_value is None:
             continue
         if start_value in seen:
+            if require_pdf_page_indexes:
+                raise RuntimeError("The AI response assigned multiple sections to the same PDF page.")
             continue
         seen.add(start_value)
         title = str(item.get("title") or item.get("name") or item.get("filename") or "").strip()[:120]
@@ -1126,7 +1167,7 @@ def parse_split_response(raw, total_units):
         entry = {"title": title or f"Part {len(cleaned) + 1}", "start_unit": start_value}
         if filename is not None and str(filename).strip():
             entry["filename"] = sanitize_pdf_split_filename(str(filename), title or f"Part {len(cleaned) + 1}")
-        if "start_page" in item:
+        if not has_page_index and "start_page" in item:
             start_page = max(1, int(item.get("start_page", 1)))
             end_page = max(start_page, int(item.get("end_page", start_page)))
             entry["start_page"] = min(start_page, total_units)
@@ -1136,8 +1177,66 @@ def parse_split_response(raw, total_units):
     if not cleaned:
         raise RuntimeError("The AI response did not contain any valid section boundaries.")
     if cleaned[0]["start_unit"] != 0:
+        if require_pdf_page_indexes:
+            raise RuntimeError("The AI response did not start the first section on the first PDF page.")
         cleaned.insert(0, {"title": "Introduction", "start_unit": 0})
     return cleaned
+
+
+def _normalized_boundary_text(text):
+    return "".join(char.casefold() for char in text if char.isalnum())
+
+
+def align_pdf_section_starts(chapters, pdf_document):
+    """Move a split back when its title heading is on the prior physical page."""
+    if pdf_document is None:
+        return chapters
+
+    aligned = [dict(chapter) for chapter in chapters]
+    for index in range(1, len(aligned)):
+        chapter = aligned[index]
+        start = int(chapter["start_unit"])
+        title = _normalized_boundary_text(chapter.get("title", ""))
+        if start <= int(aligned[index - 1]["start_unit"]) + 1 or len(title) < 12:
+            continue
+
+        page = pdf_document[start - 1]
+        page_dict = page.get_text("dict")
+        span_sizes = [
+            span.get("size", 0)
+            for block in page_dict.get("blocks", [])
+            if block.get("type") == 0
+            for line in block.get("lines", [])
+            for span in line.get("spans", [])
+            if span.get("text", "").strip()
+        ]
+        if not span_sizes:
+            continue
+        median_size = sorted(span_sizes)[len(span_sizes) // 2]
+
+        for block in page_dict.get("blocks", []):
+            if block.get("type") != 0:
+                continue
+            spans = [
+                span
+                for line in block.get("lines", [])
+                for span in line.get("spans", [])
+                if span.get("text", "").strip()
+            ]
+            block_text = _normalized_boundary_text(
+                "".join(span.get("text", "") for span in spans)
+            )
+            if title not in block_text:
+                continue
+            prominent = any(
+                "bold" in span.get("font", "").casefold()
+                or span.get("size", 0) >= median_size * 1.2
+                for span in spans
+            )
+            if prominent:
+                chapter["start_unit"] = start - 1
+                break
+    return aligned
 
 
 def chapters_to_ranges(chapters, total_units):
@@ -1438,35 +1537,46 @@ def api_ai_split():
 
     try:
         if rec["ext"] == "pdf" and provider == "gemini":
+            blocks = extract_blocks(rec["abs_path"], rec["ext"])
+            lines, total_units, unit_kind = build_outline_units(
+                blocks, rec["ext"], rec["meta"].get("units")
+            )
+            if total_units < 2:
+                return jsonify(error="Document is too short to split into chapters."), 400
+            outline_text, truncated = truncate_outline_lines(lines, 15000)
+            prompt = build_split_prompt(outline_text, unit_kind, total_units, rec["ext"])
             with open(rec["abs_path"], "rb") as fh:
                 pdf_bytes = fh.read()
-            raw = call_gemini_pdf_sections(key, rec["filename"], pdf_bytes)
-            chapters = parse_split_response(raw, rec["meta"].get("units") or 0)
-            total_units = rec["meta"].get("units") or 0
-            if total_units < 2:
-                return jsonify(error="Document is too short to split into chapters."), 400
-            ranges = chapters_to_ranges(chapters, total_units)
-            tmp_paths = split_document(rec["abs_path"], rec["ext"], ranges, target_ext=target, out_dir=session_dir())
-            truncated = False
+            raw = call_gemini_pdf_sections(key, rec["filename"], pdf_bytes, prompt)
         else:
             blocks = extract_blocks(rec["abs_path"], rec["ext"])
-            lines, total_units, unit_kind = build_outline_units(blocks, rec["ext"])
+            lines, total_units, unit_kind = build_outline_units(
+                blocks, rec["ext"], rec["meta"].get("units")
+            )
             if total_units < 2:
                 return jsonify(error="Document is too short to split into chapters."), 400
-            outline_text, truncated = truncate_text("\n".join(lines), 15000)
+            if rec["ext"] == "pdf":
+                outline_text, truncated = truncate_outline_lines(lines, 15000)
+            else:
+                outline_text, truncated = truncate_text("\n".join(lines), 15000)
             prompt = build_split_prompt(outline_text, unit_kind, total_units, rec["ext"])
             raw = call_ai(provider, key, model or DEFAULT_MODELS[provider], SPLIT_SYSTEM_PROMPT, prompt)
-            chapters = parse_split_response(raw, total_units)
-            ranges = chapters_to_ranges(chapters, total_units)
-            if rec["ext"] in ("pdf", "epub"):
-                tmp_paths = split_document(rec["abs_path"], rec["ext"], ranges, target_ext=target, out_dir=session_dir())
-            else:
-                tmp_paths = []
-                for a, b in ranges:
-                    sub = blocks[a:b + 1]
-                    p = os.path.join(session_dir(), f"tmp_{uuid.uuid4().hex}.{target}")
-                    render_blocks(sub, target, p)
-                    tmp_paths.append(p)
+        chapters = parse_split_response(
+            raw, total_units, require_pdf_page_indexes=(rec["ext"] == "pdf")
+        )
+        if rec["ext"] == "pdf" and fitz is not None:
+            with fitz.open(rec["abs_path"]) as pdf_document:
+                chapters = align_pdf_section_starts(chapters, pdf_document)
+        ranges = chapters_to_ranges(chapters, total_units)
+        if rec["ext"] in ("pdf", "epub"):
+            tmp_paths = split_document(rec["abs_path"], rec["ext"], ranges, target_ext=target, out_dir=session_dir())
+        else:
+            tmp_paths = []
+            for a, b in ranges:
+                sub = blocks[a:b + 1]
+                p = os.path.join(session_dir(), f"tmp_{uuid.uuid4().hex}.{target}")
+                render_blocks(sub, target, p)
+                tmp_paths.append(p)
     except RuntimeError as e:
         return jsonify(error=str(e)), 502
     except ValueError as e:

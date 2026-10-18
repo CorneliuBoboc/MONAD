@@ -16,6 +16,14 @@ python app.py
 
 Open **http://127.0.0.1:5000**.
 
+## Tests
+
+Run the PDF split boundary regression tests with:
+
+```bash
+python3 -m unittest discover -s projects/morphix/tests -v
+```
+
 Two dependencies are optional-but-recommended:
 
 - **PyMuPDF (`fitz`)** — without it, PDF reading falls back to `pypdf`, which
@@ -72,10 +80,15 @@ document converter. Concretely:
 - Manual "split by range" for DOCX/HTML/MD/TXT requires existing top-level
   headings to define section boundaries; if none exist, use "Split smart by
   chapters (AI)" instead.
-- Very large documents are truncated before being sent to an AI provider
+- Very large documents are shortened before being sent to an AI provider
   (~15,000 characters for chapter-boundary analysis, ~100,000 characters for
   TOC generation) to stay within reasonable request sizes; the UI tells you
-  when truncation happened.
+  when this happened. PDF chapter outlines are sampled evenly across the
+  document so later chapters are represented too. PDF split boundaries use
+  zero-based physical page indices (not printed page numbers), and each
+  section runs up to the page before the next section starts. If a section's
+  prominent title is printed on the preceding page, that page is assigned to
+  the section so its opening heading is not left behind.
 - AZW3 conversion downloads KindleUnpack from its upstream GitHub repository
   on first use, runs it with `--epub_version=2`, and removes its per-conversion
   temporary files afterward. AZW3 files are not available for splitting or AI
