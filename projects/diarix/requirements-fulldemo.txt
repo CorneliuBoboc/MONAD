@@ -2,6 +2,7 @@
 requests
 flask>=3.0
 av==18.1.0
+torchcodec==0.7.0
 faster-whisper==1.2.1
 openai-whisper>=20231117   # optional: remove if you do not need transcription
 yt-dlp                   # optional: install separately if YouTube download is needed
