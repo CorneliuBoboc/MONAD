@@ -2057,7 +2057,7 @@ footer{flex:0 0 auto; padding:9px 22px; text-align:center; font-size:11px; color
         <div id="filePool" class="file-pool hidden">
           <div class="pool-header">
             <div class="pool-title">Audio / video pool <span id="filePoolCount" style="color:var(--text-dim); font-weight:500; font-size:12px;"></span></div>
-            <button class="btn danger small" id="clearFilesBtn" type="button">Wipe list</button>
+            <button class="btn small" id="clearFilesBtn" type="button">Wipe list</button>
           </div>
           <div class="empty-note" id="filePoolEmpty">No files yet — choose one or more files above.</div>
           <ul id="filePoolList"></ul>
