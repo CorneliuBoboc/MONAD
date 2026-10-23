@@ -74,6 +74,13 @@ def _empty_transcription_status():
     return {"state": "idle", "completed": 0, "total": 0, "error": None}
 
 
+def reset_transcription_state(sess):
+    sess["transcriptions"] = []
+    sess["transcript"] = None
+    sess["segments"] = []
+    sess["transcription_status"] = _empty_transcription_status()
+
+
 def _new_session_dict(sid):
     d = os.path.join(BASE_DIR, sid)
     os.makedirs(d, exist_ok=True)
@@ -146,12 +153,10 @@ def wipe_session_dir(sess):
     os.makedirs(sess["dir"], exist_ok=True)
     sess["source"] = None
     sess["chunks"] = []
-    sess["transcript"] = None
     sess["segments"] = []
     sess["source_files"] = []
     sess["multifile"] = False
-    sess["transcriptions"] = []
-    sess["transcription_status"] = _empty_transcription_status()
+    reset_transcription_state(sess)
 
 
 def public_file_entry(f):
@@ -285,8 +290,8 @@ def transcription_device(engine, device):
 
 
 def cpu_fallback_engine(engine):
-    """Return an engine that can run on CPU when the selected GPU engine cannot."""
-    return "faster" if engine == "mlx" else engine
+    """Keep MLX on its own engine; other engines keep their current selection."""
+    return engine
 
 
 def run_cpu_jobs(jobs, worker_count=None):
@@ -623,7 +628,7 @@ def transcribe_one_source_file(
 
 
 def publish_ready_transcriptions(sess, slots, publish_lock):
-    """Expose every finished file, ordered by its position in the source list."""
+    """Expose every finished file in the original source order."""
     with publish_lock, sess["lock"]:
         results = []
         for item in slots:
@@ -631,7 +636,6 @@ def publish_ready_transcriptions(sess, slots, publish_lock):
                 break
             results.append(item)
         sess["transcriptions"] = results
-        # Multi-file results remain independent; never create a combined transcript.
         sess["transcript"] = None
         sess["transcription_status"]["completed"] = len(results)
         return list(results)
@@ -641,43 +645,18 @@ def run_multifile_transcriptions(
     sess, source_files, engine, language, device, model_size,
     diarize, diarize_method, ai_provider, api_key, num_speakers,
 ):
-    """Transcribe files concurrently, using CPU workers when GPU slots are full.
-
-    Results are published one-by-one in the user-established file order, even
-    when workers finish out of order.
-    """
+    """Transcribe files in source order. MLX batches stay strictly sequential."""
     n = len(source_files)
     slots = [None] * n
     publish_lock = threading.Lock()
     first_error = []
 
-    def work(idx, f, cpu_fallback=False):
+    def work(idx, f):
         try:
-            try:
-                result = transcribe_one_source_file(
-                    f, engine, language, device, model_size,
-                    diarize, diarize_method, ai_provider, api_key, num_speakers,
-                    engine_override=cpu_fallback_engine(engine) if cpu_fallback else None,
-                    device_override="cpu" if cpu_fallback else None,
-                )
-            except Exception as gpu_error:
-                if not uses_gpu_device(engine, device) or cpu_fallback:
-                    raise
-                app.logger.warning(
-                    "GPU transcription failed for %s; retrying on CPU: %s",
-                    f.get("name", f.get("path")), gpu_error,
-                )
-                try:
-                    result = transcribe_one_source_file(
-                        f, engine, language, "cpu", model_size,
-                        diarize, diarize_method, ai_provider, api_key, num_speakers,
-                        engine_override=cpu_fallback_engine(engine),
-                        device_override="cpu",
-                    )
-                except Exception as cpu_error:
-                    raise RuntimeError(
-                        f"GPU transcription failed ({gpu_error}); CPU fallback failed ({cpu_error})."
-                    ) from cpu_error
+            result = transcribe_one_source_file(
+                f, engine, language, device, model_size,
+                diarize, diarize_method, ai_provider, api_key, num_speakers,
+            )
             return idx, result, None
         except Exception as exc:
             return idx, None, exc
@@ -697,20 +676,18 @@ def run_multifile_transcriptions(
             raise first_error[0]
         return list(sess["transcriptions"])
 
-    on_gpu = uses_gpu_device(engine, device)
-
     if force_sequential() or n <= 1:
         return run_sequential()
+    if engine == "mlx":
+        return run_sequential()
 
+    on_gpu = uses_gpu_device(engine, device)
     if on_gpu:
         gpu_workers = min(gpu_worker_count(), n)
         cpu_workers = min(cpu_worker_count(max(n - gpu_workers, 1)), n - gpu_workers)
         try:
             with ThreadPoolExecutor(max_workers=gpu_workers + cpu_workers) as pool:
-                futures = [
-                    pool.submit(work, i, f, i >= gpu_workers)
-                    for i, f in enumerate(source_files)
-                ]
+                futures = [pool.submit(work, i, f) for i, f in enumerate(source_files)]
                 for fut in as_completed(futures):
                     idx, result, exc = fut.result()
                     consume(idx, result, exc)
@@ -720,9 +697,7 @@ def run_multifile_transcriptions(
         except Exception as exc:
             if first_error:
                 raise first_error[0]
-            app.logger.warning(
-                "GPU/CPU transcription pool failed (%s); falling back to sequential.", exc
-            )
+            app.logger.warning("GPU/CPU transcription pool failed (%s); sequential fallback.", exc)
             with sess["lock"]:
                 sess["transcriptions"] = []
                 sess["transcription_status"]["completed"] = 0
@@ -745,9 +720,7 @@ def run_multifile_transcriptions(
     except Exception as exc:
         if first_error:
             raise first_error[0]
-        app.logger.warning(
-            "CPU transcription pool failed (%s); sequential fallback.", exc
-        )
+        app.logger.warning("CPU transcription pool failed (%s); sequential fallback.", exc)
         with sess["lock"]:
             sess["transcriptions"] = []
             sess["transcription_status"]["completed"] = 0
@@ -1145,9 +1118,7 @@ def api_load(_session=None, _sid=None):
             return jsonify(error="None of the newly uploaded files could be read as media."), 400
 
         sess["source_files"].extend(loaded)
-        sess["transcriptions"] = []
-        sess["transcription_status"] = _empty_transcription_status()
-        # Clear chunks — they belong to the previous primary source.
+        reset_transcription_state(sess)
         for c in sess.get("chunks") or []:
             try:
                 os.remove(c["path"])
@@ -1244,10 +1215,7 @@ def api_load(_session=None, _sid=None):
                 return jsonify(error=f"YouTube download failed: {e}"), 400
 
             sess["source_files"].extend(added)
-            sess["transcriptions"] = []
-            sess["transcript"] = None
-            sess["segments"] = []
-            sess["transcription_status"] = _empty_transcription_status()
+            reset_transcription_state(sess)
             for chunk in sess.get("chunks") or []:
                 try:
                     os.remove(chunk["path"])
