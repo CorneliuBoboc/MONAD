@@ -13,6 +13,7 @@ Run:
 import io
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -39,12 +40,9 @@ SESSIONS = {}
 ACTIVE_SID = None
 _SESS_LOCK = threading.RLock()
 
-# GPU work is serialized by default (single permitted thread). Override via
-# DIARIX_GPU_WORKERS only as an experimental escape hatch; values <1 or
-# invalid fall back to 1. DIARIX_FORCE_SEQUENTIAL=1 disables all pools.
-GPU_DEVICES = {"cuda", "metal"}
-
-
+# GPU capacity defaults to one worker; other files use CPU workers concurrently.
+# DIARIX_GPU_WORKERS overrides this experimentally; invalid values fall back to 1.
+# DIARIX_FORCE_SEQUENTIAL=1 disables all pools.
 def gpu_worker_count():
     """GPU concurrency. Default and hard fallback: a single thread."""
     raw = os.environ.get("DIARIX_GPU_WORKERS", "1").strip()
@@ -74,6 +72,13 @@ VALID_LANGUAGES = {"auto", "de", "en", "fr", "ro"}
 
 def _empty_transcription_status():
     return {"state": "idle", "completed": 0, "total": 0, "error": None}
+
+
+def reset_transcription_state(sess):
+    sess["transcriptions"] = []
+    sess["transcript"] = None
+    sess["segments"] = []
+    sess["transcription_status"] = _empty_transcription_status()
 
 
 def _new_session_dict(sid):
@@ -148,12 +153,10 @@ def wipe_session_dir(sess):
     os.makedirs(sess["dir"], exist_ok=True)
     sess["source"] = None
     sess["chunks"] = []
-    sess["transcript"] = None
     sess["segments"] = []
     sess["source_files"] = []
     sess["multifile"] = False
-    sess["transcriptions"] = []
-    sess["transcription_status"] = _empty_transcription_status()
+    reset_transcription_state(sess)
 
 
 def public_file_entry(f):
@@ -252,13 +255,43 @@ def cpu_worker_count(n_tasks):
             return max(1, min(int(raw), n_tasks))
         except ValueError:
             pass
-    return max(1, min(os.cpu_count() or 2, n_tasks, 8))
+    return max(1, min(max(os.cpu_count() or 2, 3), n_tasks, 8))
+
+
+def is_youtube_url(url):
+    parsed = urlparse(url if "://" in url else f"https://{url}")
+    host = (parsed.hostname or "").lower()
+    return parsed.scheme in {"http", "https"} and (
+        host == "youtu.be" or host == "youtube.com" or host.endswith(".youtube.com")
+    )
 
 
 def uses_gpu_device(engine, device):
     if engine == "mlx":
-        return True
-    return (device or "").lower() in GPU_DEVICES
+        return platform.system() == "Darwin"
+    requested = (device or "").lower()
+    return requested == "cuda" or (
+        requested == "metal"
+        and engine == "openai-whisper"
+        and platform.system() == "Darwin"
+    )
+
+
+def transcription_device(engine, device):
+    """Resolve UI device choices to a device supported by the selected engine."""
+    requested = (device or "").lower()
+    if engine == "mlx":
+        return "cpu"  # The MLX CLI selects Apple Silicon hardware itself.
+    if requested == "cuda":
+        return "cuda"
+    if requested == "metal" and engine == "openai-whisper" and platform.system() == "Darwin":
+        return "mps"
+    return "cpu"
+
+
+def cpu_fallback_engine(engine):
+    """Keep MLX on its own engine; other engines keep their current selection."""
+    return engine
 
 
 def run_cpu_jobs(jobs, worker_count=None):
@@ -523,15 +556,14 @@ def _transcribe_file_unlocked(path, engine, language, device, model_size, hf_tok
 
 
 def transcribe_file(path, engine, language, device, model_size, hf_token=None, diarize=False):
-    """Transcribe one file. GPU/Metal/MLX calls are serialized process-wide."""
+    """Transcribe one file, resolving platform-specific device names."""
     def _run():
         return _transcribe_file_unlocked(
-            path, engine, language, device, model_size, hf_token=hf_token, diarize=diarize,
+            path, engine, language, transcription_device(engine, device), model_size,
+            hf_token=hf_token, diarize=diarize,
         )
 
     if uses_gpu_device(engine, device):
-        # Experimental multi-worker GPU still funnels through the gate so the
-        # hardware sees one job at a time unless the semaphore is widened.
         return run_gpu_exclusive(_run)
     return _run()
 
@@ -578,10 +610,13 @@ def apply_diarization_to_segments(
 def transcribe_one_source_file(
     f, engine, language, device, model_size,
     diarize, diarize_method, ai_provider, api_key, num_speakers,
+    engine_override=None, device_override=None,
 ):
     """Full per-file pipeline used by multi-file mode."""
+    selected_engine = engine_override or engine
+    selected_device = device_override or device
     segs = transcribe_file(
-        f["path"], engine, language, device, model_size,
+        f["path"], selected_engine, language, selected_device, model_size,
         hf_token=api_key, diarize=False,
     )
     norm_segs = normalize_segments(segs)
@@ -593,11 +628,14 @@ def transcribe_one_source_file(
 
 
 def publish_ready_transcriptions(sess, slots, publish_lock):
-    """Expose every finished file, ordered by its position in the source list."""
+    """Expose every finished file in the original source order."""
     with publish_lock, sess["lock"]:
-        results = [item for item in slots if item is not None]
+        results = []
+        for item in slots:
+            if item is None:
+                break
+            results.append(item)
         sess["transcriptions"] = results
-        # Multi-file results remain independent; never create a combined transcript.
         sess["transcript"] = None
         sess["transcription_status"]["completed"] = len(results)
         return list(results)
@@ -607,11 +645,7 @@ def run_multifile_transcriptions(
     sess, source_files, engine, language, device, model_size,
     diarize, diarize_method, ai_provider, api_key, num_speakers,
 ):
-    """Transcribe many files with CPU parallelism / GPU serialization.
-
-    Results are published one-by-one in the user-established file order, even
-    when workers finish out of order.
-    """
+    """Transcribe files in source order. MLX batches stay strictly sequential."""
     n = len(source_files)
     slots = [None] * n
     publish_lock = threading.Lock()
@@ -619,10 +653,11 @@ def run_multifile_transcriptions(
 
     def work(idx, f):
         try:
-            return idx, transcribe_one_source_file(
+            result = transcribe_one_source_file(
                 f, engine, language, device, model_size,
                 diarize, diarize_method, ai_provider, api_key, num_speakers,
-            ), None
+            )
+            return idx, result, None
         except Exception as exc:
             return idx, None, exc
 
@@ -641,17 +676,17 @@ def run_multifile_transcriptions(
             raise first_error[0]
         return list(sess["transcriptions"])
 
-    on_gpu = uses_gpu_device(engine, device)
-
     if force_sequential() or n <= 1:
         return run_sequential()
+    if engine == "mlx":
+        return run_sequential()
 
+    on_gpu = uses_gpu_device(engine, device)
     if on_gpu:
-        workers = gpu_worker_count()
-        if workers <= 1:
-            return run_sequential()
+        gpu_workers = min(gpu_worker_count(), n)
+        cpu_workers = min(cpu_worker_count(max(n - gpu_workers, 1)), n - gpu_workers)
         try:
-            with ThreadPoolExecutor(max_workers=workers) as pool:
+            with ThreadPoolExecutor(max_workers=gpu_workers + cpu_workers) as pool:
                 futures = [pool.submit(work, i, f) for i, f in enumerate(source_files)]
                 for fut in as_completed(futures):
                     idx, result, exc = fut.result()
@@ -662,9 +697,7 @@ def run_multifile_transcriptions(
         except Exception as exc:
             if first_error:
                 raise first_error[0]
-            app.logger.warning(
-                "GPU pool path failed (%s); falling back to sequential.", exc
-            )
+            app.logger.warning("GPU/CPU transcription pool failed (%s); sequential fallback.", exc)
             with sess["lock"]:
                 sess["transcriptions"] = []
                 sess["transcription_status"]["completed"] = 0
@@ -687,9 +720,7 @@ def run_multifile_transcriptions(
     except Exception as exc:
         if first_error:
             raise first_error[0]
-        app.logger.warning(
-            "CPU transcription pool failed (%s); sequential fallback.", exc
-        )
+        app.logger.warning("CPU transcription pool failed (%s); sequential fallback.", exc)
         with sess["lock"]:
             sess["transcriptions"] = []
             sess["transcription_status"]["completed"] = 0
@@ -1029,7 +1060,15 @@ def api_load(_session=None, _sid=None):
         up_list = [single]
     up_list = [u for u in up_list if u and u.filename]
 
-    url = (request.form.get("url") or "").strip()
+    urls = [
+        item.strip()
+        for item in (request.form.get("urls") or "").splitlines()
+        if item.strip()
+    ]
+    if not urls:
+        url = (request.form.get("url") or "").strip()
+        if url:
+            urls = [url]
 
     if up_list:
         # ---- additive disk-upload path ----
@@ -1079,9 +1118,7 @@ def api_load(_session=None, _sid=None):
             return jsonify(error="None of the newly uploaded files could be read as media."), 400
 
         sess["source_files"].extend(loaded)
-        sess["transcriptions"] = []
-        sess["transcription_status"] = _empty_transcription_status()
-        # Clear chunks — they belong to the previous primary source.
+        reset_transcription_state(sess)
         for c in sess.get("chunks") or []:
             try:
                 os.remove(c["path"])
@@ -1092,49 +1129,119 @@ def api_load(_session=None, _sid=None):
 
         return jsonify(**files_payload(sess, sid))
 
-    if url:
-        # ---- URL path: always single-file, multifile=False ----
-        wipe_session_dir(sess)
-        is_youtube = any(domain in url.lower() for domain in ['youtube.com', 'youtu.be'])
-        src_path = None
-
-        if is_youtube:
+    if urls:
+        youtube_urls = [is_youtube_url(item) for item in urls]
+        if len(urls) > 1 and not all(youtube_urls):
+            return jsonify(error="Multiple URLs are supported only for YouTube links."), 400
+        if all(youtube_urls):
+            # YouTube sources join the same ordered pool as uploaded media.
+            files_dir = os.path.join(sess["dir"], "sources")
+            os.makedirs(files_dir, exist_ok=True)
+            format_option = (
+                "bestaudio/best"
+                if len(urls) > 1
+                else request.form.get("format_option") or "best"
+            )
+            added = []
+            prefixes = []
             try:
                 import yt_dlp
-                format_option = request.form.get('format_option', 'best')
-                ydl_opts = {
-                    'format': format_option,
-                    'outtmpl': os.path.join(sess["dir"], 'source.%(ext)s'),
-                    'quiet': True,
-                    'no_warnings': True,
-                }
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
-                    downloaded_file = ydl.prepare_filename(info)
+                for index, youtube_url in enumerate(urls, start=len(sess["source_files"]) + 1):
+                    file_id = uuid4().hex
+                    prefix = f"youtube_{index}_{file_id}"
+                    prefixes.append(prefix)
+                    ydl_opts = {
+                        "format": format_option,
+                        "outtmpl": os.path.join(files_dir, f"{prefix}.%(ext)s"),
+                        "quiet": True,
+                        "no_warnings": True,
+                    }
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        info = ydl.extract_info(youtube_url, download=True)
+                        downloaded_file = ydl.prepare_filename(info)
                     base = os.path.splitext(downloaded_file)[0]
-                    for f in os.listdir(sess["dir"]):
-                        if f.startswith(os.path.basename(base)):
-                            src_path = os.path.join(sess["dir"], f)
-                            break
+                    candidates = [
+                        downloaded_file,
+                        *(base + ext for ext in (".mp4", ".mkv", ".webm", ".m4a", ".mp3")),
+                    ]
+                    src_path = next(
+                        (path for path in candidates if os.path.isfile(path)),
+                        None,
+                    )
                     if not src_path:
-                        return jsonify(error="YouTube download completed but file not found."), 500
+                        src_path = next(
+                            (
+                                os.path.join(files_dir, name)
+                                for name in os.listdir(files_dir)
+                                if name.startswith(prefix) and os.path.isfile(os.path.join(files_dir, name))
+                            ),
+                            None,
+                        )
+                    if not src_path:
+                        raise RuntimeError(f"YouTube download completed but file was not found for link {index}.")
+
+                    media_info = probe_media(src_path)
+                    if media_info is None:
+                        raise RuntimeError(f"Downloaded YouTube link {index} is not readable media.")
+                    ext = os.path.splitext(src_path)[1].lower()
+                    title = secure_filename((info.get("title") or "").strip()) or f"youtube_{index}"
+                    added.append({
+                        "id": file_id,
+                        "path": src_path,
+                        "name": f"{title}{ext}",
+                        "ext": ext,
+                        "kind": media_info["kind"],
+                        "duration": media_info["duration"],
+                        "file_size": media_info["file_size"],
+                        "format": media_info["format"],
+                        "video_info": media_info["video_info"],
+                        "audio_info": media_info["audio_info"],
+                    })
             except ImportError:
+                for name in os.listdir(files_dir):
+                    if any(name.startswith(prefix) for prefix in prefixes):
+                        try:
+                            os.remove(os.path.join(files_dir, name))
+                        except OSError:
+                            pass
                 return jsonify(error="yt-dlp is not installed on the server (pip install yt-dlp)."), 500
             except Exception as e:
+                for name in os.listdir(files_dir):
+                    if any(name.startswith(prefix) for prefix in prefixes):
+                        try:
+                            os.remove(os.path.join(files_dir, name))
+                        except OSError:
+                            pass
                 return jsonify(error=f"YouTube download failed: {e}"), 400
-        else:
-            ext = os.path.splitext(urlparse(url).path)[1].lower()
-            if ext not in VIDEO_EXTS | AUDIO_EXTS:
-                ext = ".mp4"
-            src_path = os.path.join(sess["dir"], f"source{ext}")
-            try:
-                with requests.get(url, stream=True, timeout=30) as r:
-                    r.raise_for_status()
-                    with open(src_path, "wb") as fh:
-                        for chunk in r.iter_content(65536):
-                            fh.write(chunk)
-            except Exception as e:
-                return jsonify(error=f"Could not download that URL ({e})."), 400
+
+            sess["source_files"].extend(added)
+            reset_transcription_state(sess)
+            for chunk in sess.get("chunks") or []:
+                try:
+                    os.remove(chunk["path"])
+                except OSError:
+                    pass
+            sess["chunks"] = []
+            sync_primary_source(sess)
+            return jsonify(**files_payload(sess, sid))
+
+        # ---- Non-YouTube URLs retain the existing single-source behavior. ----
+        url = urls[0]
+        wipe_session_dir(sess)
+        src_path = None
+
+        ext = os.path.splitext(urlparse(url).path)[1].lower()
+        if ext not in VIDEO_EXTS | AUDIO_EXTS:
+            ext = ".mp4"
+        src_path = os.path.join(sess["dir"], f"source{ext}")
+        try:
+            with requests.get(url, stream=True, timeout=30) as r:
+                r.raise_for_status()
+                with open(src_path, "wb") as fh:
+                    for chunk in r.iter_content(65536):
+                        fh.write(chunk)
+        except Exception as e:
+            return jsonify(error=f"Could not download that URL ({e})."), 400
 
         info = probe_media(src_path)
         if info is None:
@@ -1171,8 +1278,7 @@ def api_youtube_formats():
     if not url:
         return jsonify(error="Provide a YouTube URL."), 400
 
-    is_youtube = any(domain in url.lower() for domain in ['youtube.com', 'youtu.be'])
-    if not is_youtube:
+    if not is_youtube_url(url):
         return jsonify(error="Not a YouTube URL."), 400
 
     try:
@@ -1932,8 +2038,8 @@ footer{flex:0 0 auto; padding:9px 22px; text-align:center; font-size:11px; color
           <input type="file" id="fileInput" accept="video/*,audio/*" multiple>
         </div>
         <div class="field hidden" id="urlField">
-          <label for="urlInput">Media URL</label>
-          <input type="url" id="urlInput" placeholder="https://example.com/clip.mp4">
+          <label for="urlInput">Media URL(s) — enter one URL per line; multiple YouTube links are supported</label>
+          <textarea id="urlInput" rows="3" placeholder="https://youtu.be/…&#10;https://www.youtube.com/watch?v=…"></textarea>
         </div>
 
         <!-- YouTube format selector (only shown for YouTube URLs) -->
@@ -1951,7 +2057,7 @@ footer{flex:0 0 auto; padding:9px 22px; text-align:center; font-size:11px; color
         <div id="filePool" class="file-pool hidden">
           <div class="pool-header">
             <div class="pool-title">Audio / video pool <span id="filePoolCount" style="color:var(--text-dim); font-weight:500; font-size:12px;"></span></div>
-            <button class="btn danger small" id="clearFilesBtn" type="button">Wipe list</button>
+            <button class="btn small" id="clearFilesBtn" type="button">Wipe list</button>
           </div>
           <div class="empty-note" id="filePoolEmpty">No files yet — choose one or more files above.</div>
           <ul id="filePoolList"></ul>
@@ -2190,6 +2296,18 @@ const fetchFormatsBtn = document.getElementById('fetchFormatsBtn');
 const mediaInfoPanel = document.getElementById('mediaInfoPanel');
 const mediaInfoGrid = document.getElementById('mediaInfoGrid');
 
+function getUrlLines(){
+  return document.getElementById('urlInput').value
+    .split(/\r?\n/).map(url => url.trim()).filter(Boolean);
+}
+
+function isYoutubeUrl(url){
+  try{
+    const host = new URL(url).hostname.toLowerCase();
+    return host === 'youtu.be' || host === 'youtube.com' || host.endsWith('.youtube.com');
+  }catch(e){ return false; }
+}
+
 modeUpload.addEventListener('click', ()=>{
   modeUpload.classList.add('active'); modeUrl.classList.remove('active');
   uploadField.classList.remove('hidden'); urlField.classList.add('hidden');
@@ -2199,14 +2317,14 @@ modeUpload.addEventListener('click', ()=>{
 modeUrl.addEventListener('click', ()=>{
   modeUrl.classList.add('active'); modeUpload.classList.remove('active');
   urlField.classList.remove('hidden'); uploadField.classList.add('hidden');
-  document.getElementById('loadBtn').textContent = 'Load from URL';
+  document.getElementById('loadBtn').textContent = 'Load URL(s)';
 });
 
 document.getElementById('urlInput').addEventListener('input', ()=>{
-  const url = document.getElementById('urlInput').value.trim();
-  const isYoutube = url.includes('youtube.com') || url.includes('youtu.be');
+  const urls = getUrlLines();
+  const canSelectFormat = urls.length === 1 && isYoutubeUrl(urls[0]);
 
-  if (modeUrl.classList.contains('active') && isYoutube) {
+  if (modeUrl.classList.contains('active') && canSelectFormat) {
     youtubeFormatField.classList.remove('hidden');
     formatSelector.classList.add('hidden');
     state.selectedFormat = null;
@@ -2217,9 +2335,14 @@ document.getElementById('urlInput').addEventListener('input', ()=>{
 });
 
 fetchFormatsBtn.addEventListener('click', async ()=>{
-  const url = document.getElementById('urlInput').value.trim();
+  const urls = getUrlLines();
+  const url = urls[0];
   if (!url) {
     toast('Enter a YouTube URL first.');
+    return;
+  }
+  if (urls.length !== 1 || !isYoutubeUrl(url)) {
+    toast('Fetch formats for one YouTube link at a time.');
     return;
   }
 
@@ -2515,11 +2638,11 @@ document.getElementById('loadBtn').addEventListener('click', async ()=>{
     if(!files || files.length === 0){ toast('Choose at least one file.'); return; }
     for (const f of files) fd.append('files', f);
   } else {
-    const u = document.getElementById('urlInput').value.trim();
-    if(!u){ toast('Enter a URL first.'); return; }
-    fd.append('url', u);
+    const urls = getUrlLines();
+    if(!urls.length){ toast('Enter a URL first.'); return; }
+    fd.append('urls', urls.join('\n'));
 
-    if (state.selectedFormat && (u.includes('youtube.com') || u.includes('youtu.be'))) {
+    if (state.selectedFormat && urls.length === 1 && isYoutubeUrl(urls[0])) {
       fd.append('format_option', state.selectedFormat);
     }
   }
@@ -2536,7 +2659,7 @@ document.getElementById('loadBtn').addEventListener('click', async ()=>{
       goTab('cut');
     }
   }catch(e){ toast(e.message); }
-  finally{ btn.disabled = false; btn.textContent = modeUpload.classList.contains('active') ? 'Add files' : 'Load from URL'; }
+  finally{ btn.disabled = false; btn.textContent = modeUpload.classList.contains('active') ? 'Add files' : 'Load URL(s)'; }
 });
 
 // Wipe leftover audio from any previous browser/server session on first paint.
