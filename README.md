@@ -46,6 +46,12 @@
   - runs `test.sh` for each app to install dependencies and verify startup
   - waits for outbound connectivity before starting the stack
 
+  When launched by `~/.zsh_aliases`, the launcher writes `$HOME/lau.log`.
+  It reports platform and pinned Diarix MLX versions plus concise startup
+  results; package-manager output and app request/server logs are omitted to
+  avoid including local paths, addresses, debugger details, or user content.
+  Review the report before sharing it.
+
   To recreate the environment from scratch:
 
   ```bash

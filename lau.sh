@@ -23,33 +23,47 @@ export DEMO VER
 
 kill_old() {
   for PORT in $PORTS; do
-    pids="$(lsof -i ":$PORT"|grep -v COMMAND|tr -s " " |cut -f 2 -d\ )"
-    test -n "$pids" && for pid in $pids; do
-      echo "killing process $pid (was using port $PORT)"
-      kill -term $pid 2>/dev/null
-    done
+    pids="$(lsof -ti ":$PORT" 2>/dev/null || true)"
+    if test -n "$pids"; then
+      echo "Stopping existing listener on port $PORT."
+      for pid in $pids; do
+        kill -term "$pid" 2>/dev/null || true
+      done
+    fi
   done
 }
 
 purge_pip() {
   kill_old
-  command -v deactivate  && deactivate || true
-  find . -type d -iname "venv" | xargs rm -rf || true
-  find . -type d -iname ".venv" | xargs rm -rf || true
-  rm -rf $HOME/.cache/pip || true
-  python$VER -m venv .venv
-  source .venv/bin/activate
+  command -v deactivate >/dev/null 2>&1 && deactivate >/dev/null 2>&1 || true
+  find . -type d -iname "venv" | xargs rm -rf >/dev/null 2>&1 || true
+  find . -type d -iname ".venv" | xargs rm -rf >/dev/null 2>&1 || true
+  rm -rf "$HOME/.cache/pip" >/dev/null 2>&1 || true
+  if ! python$VER -m venv .venv >/dev/null 2>&1; then
+    echo "Could not create the virtual environment." >&2
+    return 1
+  fi
+  if ! source .venv/bin/activate 2>/dev/null; then
+    echo "Could not activate the virtual environment." >&2
+    return 1
+  fi
   test -n "$VIRTUAL_ENV"
   test -d "$VIRTUAL_ENV"
   export VIRTUAL_ENV
-  pip install --upgrade pip  || true
+  pip install --upgrade pip >/dev/null 2>&1 || true
 }
 
 direct_pip() {
   kill_old
-  command -v deactivate  && deactivate || true
-  test -d .venv || python$VER -m venv .venv
-  source .venv/bin/activate || return
+  command -v deactivate >/dev/null 2>&1 && deactivate >/dev/null 2>&1 || true
+  if ! test -d .venv && ! python$VER -m venv .venv >/dev/null 2>&1; then
+    echo "Could not create the virtual environment." >&2
+    return 1
+  fi
+  if ! source .venv/bin/activate 2>/dev/null; then
+    echo "Could not activate the virtual environment." >&2
+    return 1
+  fi
   test -n "$VIRTUAL_ENV"
   test -d "$VIRTUAL_ENV"
   export VIRTUAL_ENV
@@ -65,20 +79,28 @@ launch_apps() {
 
 warm=true
 test -n "$ARG" && echo "$ARG"|grep -q "^--cold$" && warm=false
-echo "Please wait ..."
-while ! ping -c 1 8.8.8.8 &>/dev/null; do
+echo "MONAD launcher started."
+echo "Platform: $OS ($(uname -m)); Python: $VER"
+echo "Cold install: $([[ "$warm" == false ]] && echo yes || echo no)"
+echo "Waiting for network connectivity."
+while ! ping -c 1 8.8.8.8 >/dev/null 2>&1; do
   sleep 40
 done
 if $warm; then
   if direct_pip && launch_apps; then
     true
   else
-    purge_pip && launch_apps
+    if ! purge_pip || ! launch_apps; then
+      echo "MONAD launch failed; inspect the safe diagnostics above." >&2
+      exit 1
+    fi
   fi
 else
-  purge_pip && launch_apps
+  if ! purge_pip || ! launch_apps; then
+    echo "MONAD launch failed; inspect the safe diagnostics above." >&2
+    exit 1
+  fi
 fi
 
-echo "All apps have been launched"
-echo "See them on ports 5030, 5034"
-echo "Done."
+echo "All configured apps passed process startup checks."
+echo "MONAD launcher finished."
