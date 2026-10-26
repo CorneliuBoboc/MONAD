@@ -14,10 +14,13 @@ if echo "$APP"|grep -qv "^morphix$"; then
   $DEMO || command -v ffmpeg  || brew install ffmpeg 
 #  $DEMO && command -v ffmpeg  || sudo apt update && sudo apt install -y ffmpeg 
 fi
-python$VER -m pip install -r requirements.txt
-if echo "$APP"|grep -q "^diarix$"; then
+if [ "$APP" = "diarix" ] && ! $DEMO; then
   export DIARIX_MLX_WORKERS=1
-  $DEMO || command -v whispermlx  || pip install whispermlx 
+  python$VER -m pip install -r requirements.txt -r requirements-mlx.txt
+  python$VER -m pip check
+  python$VER check_mlx_audio.py
+else
+  python$VER -m pip install -r requirements.txt
 fi
 
 python$VER app.py & pid=$!

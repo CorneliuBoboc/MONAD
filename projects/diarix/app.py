@@ -10,6 +10,7 @@ Run:
     python app.py
 """
 
+import importlib.util
 import io
 import json
 import os
@@ -17,6 +18,7 @@ import platform
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import zipfile
@@ -459,15 +461,18 @@ def run_mlx_whisper_cli(path, language, model_size, hf_token=None, diarize=False
     This matches the usage pattern from test.sh and provides native diarization support.
     `language` may be None (auto-detect) or a 2-letter code.
     """
-    if not shutil.which("whispermlx"):
+    if importlib.util.find_spec("whispermlx") is None:
         raise RuntimeError(
-            "whispermlx command not found. Please install it: pip install whispermlx"
+            "whispermlx is not installed for this Python interpreter. "
+            "Please install it: pip install whispermlx"
         )
 
     # whispermlx expects a literal "auto" when no language is fixed.
     lang_arg = language if language else "auto"
 
     cmd = [
+        sys.executable,
+        "-m",
         "whispermlx",
         path,
         "--model", model_size,

@@ -1,2 +1,8 @@
-# requirements-mlx.txt
-whispermlx
+# Keep this stack aligned: TorchCodec 0.7 supports the Torch 2.8 series
+# required by WhisperMLX 3.14.0.
+whispermlx==3.14.0
+pyannote.audio==4.0.7
+torch==2.8.0
+torchaudio==2.8.0
+torchvision==0.23.0
+torchcodec==0.7.0
