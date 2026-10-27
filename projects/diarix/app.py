@@ -10,6 +10,7 @@ Run:
     python app.py
 """
 
+import importlib.util
 import io
 import json
 import os
@@ -17,10 +18,12 @@ import platform
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from functools import wraps
 from urllib.parse import urlparse
 from uuid import uuid4
@@ -458,15 +461,18 @@ def run_mlx_whisper_cli(path, language, model_size, hf_token=None, diarize=False
     This matches the usage pattern from test.sh and provides native diarization support.
     `language` may be None (auto-detect) or a 2-letter code.
     """
-    if not shutil.which("whispermlx"):
+    if importlib.util.find_spec("whispermlx") is None:
         raise RuntimeError(
-            "whispermlx command not found. Please install it: pip install whispermlx"
+            "whispermlx is not installed for this Python interpreter. "
+            "Please install it: pip install whispermlx"
         )
 
     # whispermlx expects a literal "auto" when no language is fixed.
     lang_arg = language if language else "auto"
 
     cmd = [
+        sys.executable,
+        "-m",
         "whispermlx",
         path,
         "--model", model_size,
@@ -555,13 +561,46 @@ def _transcribe_file_unlocked(path, engine, language, device, model_size, hf_tok
     raise RuntimeError(f"Unknown transcription engine '{engine}'.")
 
 
-def transcribe_file(path, engine, language, device, model_size, hf_token=None, diarize=False):
+@contextmanager
+def normalized_audio_input(path, enabled):
+    """Temporarily normalize the first audio stream to 16 kHz mono PCM WAV."""
+    if not enabled:
+        yield path
+        return
+
+    with tempfile.TemporaryDirectory(prefix="diarix-audio-") as temp_dir:
+        output_path = os.path.join(temp_dir, "audio.wav")
+        cmd = [
+            "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+            "-i", path,
+            "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000",
+            "-c:a", "pcm_s16le", output_path,
+        ]
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            detail = (
+                getattr(exc, "stderr", None)
+                or getattr(exc, "stdout", None)
+                or str(exc)
+            ).strip()
+            raise RuntimeError(
+                f"FFmpeg audio normalization failed: {detail[-1000:]}"
+            ) from exc
+        yield output_path
+
+
+def transcribe_file(
+    path, engine, language, device, model_size, hf_token=None, diarize=False,
+    normalize_audio=False,
+):
     """Transcribe one file, resolving platform-specific device names."""
     def _run():
-        return _transcribe_file_unlocked(
-            path, engine, language, transcription_device(engine, device), model_size,
-            hf_token=hf_token, diarize=diarize,
-        )
+        with normalized_audio_input(path, normalize_audio) as input_path:
+            return _transcribe_file_unlocked(
+                input_path, engine, language, transcription_device(engine, device), model_size,
+                hf_token=hf_token, diarize=diarize,
+            )
 
     if uses_gpu_device(engine, device):
         return run_gpu_exclusive(_run)
@@ -610,14 +649,14 @@ def apply_diarization_to_segments(
 def transcribe_one_source_file(
     f, engine, language, device, model_size,
     diarize, diarize_method, ai_provider, api_key, num_speakers,
-    engine_override=None, device_override=None,
+    engine_override=None, device_override=None, normalize_audio=False,
 ):
     """Full per-file pipeline used by multi-file mode."""
     selected_engine = engine_override or engine
     selected_device = device_override or device
     segs = transcribe_file(
         f["path"], selected_engine, language, selected_device, model_size,
-        hf_token=api_key, diarize=False,
+        hf_token=api_key, diarize=False, normalize_audio=normalize_audio,
     )
     norm_segs = normalize_segments(segs)
     apply_diarization_to_segments(
@@ -644,6 +683,7 @@ def publish_ready_transcriptions(sess, slots, publish_lock):
 def run_multifile_transcriptions(
     sess, source_files, engine, language, device, model_size,
     diarize, diarize_method, ai_provider, api_key, num_speakers,
+    normalize_audio=False,
 ):
     """Transcribe files in source order. MLX batches stay strictly sequential."""
     n = len(source_files)
@@ -656,6 +696,7 @@ def run_multifile_transcriptions(
             result = transcribe_one_source_file(
                 f, engine, language, device, model_size,
                 diarize, diarize_method, ai_provider, api_key, num_speakers,
+                normalize_audio=normalize_audio,
             )
             return idx, result, None
         except Exception as exc:
@@ -1434,6 +1475,7 @@ def api_transcribe():
     ai_provider = d.get("ai_provider")                 # 'gemini' | 'claude'
     api_key = d.get("api_key")
     num_speakers = d.get("num_speakers")
+    normalize_audio = d.get("normalize_audio") is True
 
     with sess["lock"]:
         if not sess.get("source"):
@@ -1455,6 +1497,7 @@ def api_transcribe():
             results = run_multifile_transcriptions(
                 sess, source_files, engine, language, device, model_size,
                 diarize, diarize_method, ai_provider, api_key, num_speakers,
+                normalize_audio=normalize_audio,
             )
         except RuntimeError as e:
             with sess["lock"]:
@@ -1491,11 +1534,12 @@ def api_transcribe():
         if engine == "mlx" and diarize:
             segs = transcribe_file(
                 item["path"], engine, language, device, model_size,
-                hf_token=api_key, diarize=True
+                hf_token=api_key, diarize=True, normalize_audio=normalize_audio,
             )
         else:
             segs = transcribe_file(
-                item["path"], engine, language, device, model_size
+                item["path"], engine, language, device, model_size,
+                normalize_audio=normalize_audio,
             )
         offset = item.get("start", 0.0)
         out = []
@@ -2147,6 +2191,12 @@ footer{flex:0 0 auto; padding:9px 22px; text-align:center; font-size:11px; color
             </select>
           </div>
         </div>
+
+        <div class="checkline">
+          <input type="checkbox" id="normalizeAudioCk">
+          <label for="normalizeAudioCk">Normalize audio before transcription (16 kHz mono WAV)</label>
+        </div>
+        <div class="empty-note" style="margin-left:24px">Optional; temporary WAVs are used for transcription only. Original files stay unchanged.</div>
 
         <div class="checkline">
           <input type="checkbox" id="diarizeCk"><label for="diarizeCk">Identify speakers (diarization)</label>
@@ -2873,6 +2923,7 @@ document.getElementById('transcribeBtn').addEventListener('click', async ()=>{
     diarize_method: pyannoteCk.checked ? 'pyannote' : (aiApiCk.checked ? 'ai_api' : null),
     ai_provider: document.getElementById('aiProviderSel').value,
     api_key: apiKeyInput.value.trim(),
+    normalize_audio: document.getElementById('normalizeAudioCk').checked,
   };
 
   btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Transcribing…';
