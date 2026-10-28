@@ -1,7 +1,5 @@
 # requirements.txt
 requests
 flask>=3.0
-faster-whisper==1.2.1; av==18.1.0; pyannote.audio
-#openai-whisper>=20231117   # optional: remove if you do not need transcription
-yt-dlp                   # optional: install separately if YouTube download is needed
+yt-dlp
 google-genai==2.23.0

@@ -18,8 +18,8 @@ python$VER -m pip install -r requirements.txt
 if echo "$APP"|grep -q "^diarix$"; then
   export DIARIX_MLX_WORKERS=1
   $DEMO || command -v whispermlx || pip install "whispermlx==3.14.0" "pyannote-audio>=4.0.0" "torch==2.8.*" "torchaudio==2.8.*" "torchcodec==0.7.*" "torchvision==0.23.*"
-  pip check
 fi
+pip check
 
 python$VER app.py & pid=$!
 sleep 8
