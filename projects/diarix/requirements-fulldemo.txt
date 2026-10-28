@@ -1,5 +1,9 @@
 # requirements.txt
 requests
-flask>=3.0
+flask
 yt-dlp
-google-genai==2.23.0
+google-genai
+pyannote-audio
+faster-whisper
+openai-whisper
+whispermlx

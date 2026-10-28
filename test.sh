@@ -14,12 +14,10 @@ if echo "$APP"|grep -qv "^morphix$"; then
   $DEMO || command -v ffmpeg  || brew install ffmpeg 
 #  $DEMO && command -v ffmpeg  || sudo apt update && sudo apt install -y ffmpeg 
 fi
-python$VER -m pip install -r requirements.txt
+(cd ../..; resolve_install.sh projects/$APP/requirements.txt .venv)
 if echo "$APP"|grep -q "^diarix$"; then
   export DIARIX_MLX_WORKERS=1
-  command -v whispermlx || pip install "whispermlx==3.14.0" "pyannote-audio>=4.0.0" "torch==2.8.*" "torchaudio==2.8.*" "torchcodec==0.11.*" "torchvision==0.23.*"
 fi
-pip check
 
 python$VER app.py & pid=$!
 sleep 8
