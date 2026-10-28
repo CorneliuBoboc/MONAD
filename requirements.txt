@@ -1,1 +1,1 @@
-requirements.template_onlymlx.txt
+requirements.lock_onlymlx.txt
