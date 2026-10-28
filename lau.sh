@@ -11,7 +11,7 @@ VER="3.12"
 DEMO=false
 echo "$OS"|grep -q "^Linux$" && DEMO=true
 $DEMO && VER="3.12"
-$DEMO && APPS=diarix
+#$DEMO && APPS=diarix
 
 test -n "$APPS"
 test -n "$DEMO"
@@ -57,6 +57,7 @@ direct_pip() {
 
 launch_apps() {
   SCRIPT="test.sh"
+  bash resolve_install.sh requirements.txt .venv
   for APP in $APPS; do
     test -n "$APP"
     bash "$SCRIPT" "$APP" && echo "Launched $APP ok"

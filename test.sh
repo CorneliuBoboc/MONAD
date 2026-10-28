@@ -14,7 +14,6 @@ if echo "$APP"|grep -qv "^morphix$"; then
   $DEMO || command -v ffmpeg  || brew install ffmpeg 
 #  $DEMO && command -v ffmpeg  || sudo apt update && sudo apt install -y ffmpeg 
 fi
-(cd ../..; bash resolve_install.sh projects/$APP/requirements.txt .venv)
 if echo "$APP"|grep -q "^diarix$"; then
   export DIARIX_MLX_WORKERS=1
 fi
