@@ -2113,11 +2113,9 @@ footer{flex:0 0 auto; padding:9px 22px; text-align:center; font-size:11px; color
           <div class="field">
             <label for="engineSel">Engine</label>
             <select id="engineSel">
-              <!--
+              <option value="mlx">whispermlx (Apple Silicon)</option>
               <option value="openai-whisper">openai-whisper</option>
               <option value="faster">faster-whisper</option>
-              -->
-              <option value="mlx">whispermlx (Apple Silicon)</option>
             </select>
           </div>
           <div class="field">
