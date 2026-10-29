@@ -57,9 +57,10 @@ direct_pip() {
 
 launch_apps() {
   SCRIPT="test.sh"
-  ln -sf requirements.template_faster.txt requirements.template_whisper.txt
+  ln -sf requirements.template_mlx.txt requirements.template_whisper.txt
   $DEMO || ln -sf requirements.template_mlx.txt requirements.template_whisper.txt
   bash resolve_install.sh requirements.txt .venv
+  mv requirements.lock.txt requirements.lock_base.txt
   bash resolve_install.sh requirements.template_whisper.txt .venv
   source .venv/bin/activate
   for APP in $APPS; do
