@@ -1,1 +1,1 @@
-requirements.template_mlx.txt
+requirements.template_faster.txt
