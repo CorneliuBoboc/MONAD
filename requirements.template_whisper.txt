@@ -1,1 +1,1 @@
-requirements.template_faster.txt
+requirements.template_openai.txt
