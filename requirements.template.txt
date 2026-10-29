@@ -1,0 +1,17 @@
+# requirements.txt
+EbookLib
+Flask
+PyMuPDF
+beautifulsoup4
+#faster-whisper
+flask
+google-genai
+lxml
+#openai-whisper
+#pyannote-audio
+pypdf
+python-docx
+reportlab
+requests
+#whispermlx
+yt-dlp

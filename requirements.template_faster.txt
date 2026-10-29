@@ -1,0 +1,3 @@
+faster-whisper==1.2.1
+pyannote-audio
+av==18.1.0
