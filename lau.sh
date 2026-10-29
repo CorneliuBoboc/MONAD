@@ -57,6 +57,7 @@ direct_pip() {
 
 launch_apps() {
   SCRIPT="test.sh"
+  rm -rf requirements.lock.txt
   ln -sf requirements.template_mlx.txt requirements.template_whisper.txt
   $DEMO || ln -sf requirements.template_mlx.txt requirements.template_whisper.txt
   bash resolve_install.sh requirements.txt .venv
