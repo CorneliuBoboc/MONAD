@@ -12,7 +12,7 @@ IFS=$'\n\t'
 REQ_FILE="${1:-requirements.txt}"
 VENV_DIR="${2:-.venv}"
 LOCK_FILE="requirements.lock.txt"
-VER=3.14
+: ${VER:=3.14}
 
 if [[ ! -f "$REQ_FILE" ]]; then
     echo "Error: '$REQ_FILE' not found." >&2
