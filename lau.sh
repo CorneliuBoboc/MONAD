@@ -13,7 +13,7 @@ echo "$OS"|grep -q "^Linux$" && DEMO=true
 $DEMO && VER="3.12"
 $DEMO && APPS=diarix
 ENGINE=mlx
-$DEMO && ENGINE=mlx
+$DEMO && ENGINE=openai
 
 test -n "$APPS"
 test -n "$DEMO"
@@ -60,8 +60,8 @@ direct_pip() {
 launch_apps() {
   SCRIPT="test.sh"
   rm -rf requirements.lock.txt
-  ln -sf requirements.template_$ENGINE.txt requirements.template_whisper.txt
-  $DEMO || ln -sf requirements.template_mlx.txt requirements.template_whisper.txt
+  ln -sf requirements.template_mlx.txt requirements.template_whisper.txt
+  $DEMO || ln -sf requirements.template_$ENGINE.txt requirements.template_whisper.txt
   bash resolve_install.sh requirements.txt .venv
   mv requirements.lock.txt requirements.lock_base.txt
   bash resolve_install.sh requirements.template_whisper.txt .venv
