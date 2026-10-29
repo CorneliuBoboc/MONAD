@@ -1,3 +1,4 @@
-faster-whisper
+#faster-whisper
 #openai-whisper
 whispermlx
+pyannote-audio

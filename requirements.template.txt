@@ -8,7 +8,7 @@ flask
 google-genai
 lxml
 #openai-whisper
-pyannote-audio
+#pyannote-audio
 pypdf
 python-docx
 reportlab
