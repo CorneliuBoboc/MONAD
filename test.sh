@@ -11,7 +11,7 @@ test -n "$VER"
 cd ./projects/$APP
 
 if echo "$APP"|grep -qv "^morphix$"; then
-  $DEMO || command -v ffmpeg  || brew install ffmpeg 
+  $DEMO || command -v ffmpeg  || brew install ffmpeg@7
 #  $DEMO && command -v ffmpeg  || sudo apt update && sudo apt install -y ffmpeg 
 fi
 if echo "$APP"|grep -q "^diarix$"; then

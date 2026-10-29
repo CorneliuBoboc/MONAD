@@ -10,6 +10,8 @@ Run:
     python app.py
 """
 
+import logging
+import sys
 import io
 import json
 import os
@@ -32,6 +34,12 @@ from flask import (
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
+
+logging.basicConfig(
+    stream=sys.stdout,
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s: %(message)s",
+)
 
 BASE_DIR = os.path.join(tempfile.gettempdir(), "media_editor_sessions")
 
@@ -1529,6 +1537,7 @@ def api_transcribe():
             sess["transcription_status"].update(
                 state="failed", error=f"Transcription failed: {e}"
             )
+        app.logger.exception(f"Eroare la transcriere: {e}")
         return jsonify(error=f"Transcription failed: {e}"), 500
 
     # Handle diarization for non-MLX engines or when MLX didn't provide speakers
