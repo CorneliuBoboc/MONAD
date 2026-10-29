@@ -12,28 +12,29 @@ IFS=$'\n\t'
 REQ_FILE="${1:-requirements.txt}"
 VENV_DIR="${2:-.venv}"
 LOCK_FILE="requirements.lock.txt"
+VER=3.14
 
 if [[ ! -f "$REQ_FILE" ]]; then
     echo "Error: '$REQ_FILE' not found." >&2
     exit 1
 fi
 
-command -v python3 >/dev/null 2>&1 || { echo "Error: python3 is required." >&2; exit 1; }
+command -v python$VER >/dev/null 2>&1 || { echo "Error: python$VER is required." >&2; exit 1; }
 
 # Isolated environment: never touches system or user site-packages.
 if [[ ! -d "$VENV_DIR" ]]; then
-    python3 -m venv "$VENV_DIR"
+    python$VER -m venv "$VENV_DIR"
 fi
 # shellcheck disable=SC1091
 source "$VENV_DIR/bin/activate"
 
-python -m pip install --quiet --upgrade pip
+python$VER -m pip install --quiet --upgrade pip
 
 REPORT="$(mktemp)"
 trap 'rm -f "$REPORT"' EXIT
 
 echo ">> Resolving all requirements together..."
-if ! python -m pip install \
+if ! python$VER -m pip install \
         --dry-run \
         --ignore-installed \
         --quiet \
@@ -45,7 +46,7 @@ if ! python -m pip install \
 fi
 
 # Extract the exact versions the resolver selected (direct + transitive).
-python - "$REPORT" "$LOCK_FILE" <<'PY'
+python$VER - "$REPORT" "$LOCK_FILE" <<'PY'
 import json
 import sys
 
@@ -68,9 +69,9 @@ print(f">> Resolved {len(pins)} packages -> {lock_path}")
 PY
 
 echo ">> Installing resolved versions..."
-python -m pip install -r "$LOCK_FILE"
+python$VER -m pip install -r "$LOCK_FILE"
 
 echo ">> Verifying dependency consistency..."
-python -m pip check
+python$VER -m pip check
 
 echo ">> Done. Activate with: source $VENV_DIR/bin/activate"

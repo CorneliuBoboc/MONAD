@@ -10,8 +10,8 @@ VER="3.12"
 
 DEMO=false
 echo "$OS"|grep -q "^Linux$" && DEMO=true
-$DEMO && VER="3.12"
-#$DEMO && APPS=diarix
+$DEMO && VER="3.14"
+$DEMO && APPS=diarix
 
 test -n "$APPS"
 test -n "$DEMO"
@@ -57,8 +57,10 @@ direct_pip() {
 
 launch_apps() {
   SCRIPT="test.sh"
-#  $DEMO || ln -s requirements.lock_onlymlx.txt requirements.txt
+  $DEMO || ln -s requirements.lock_onlymlx.txt requirements.txt
   bash resolve_install.sh requirements.txt .venv
+  bash resolve_install.sh requirements.template_mlx.txt .venv
+  source .venv/bin/activate
   for APP in $APPS; do
     test -n "$APP"
     bash "$SCRIPT" "$APP" && echo "Launched $APP ok"
