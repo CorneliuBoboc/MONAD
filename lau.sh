@@ -57,6 +57,7 @@ direct_pip() {
 
 launch_apps() {
   SCRIPT="test.sh"
+  $DEMO || ln -s requirements.lock_onlymlx.txt requirements.txt
   bash resolve_install.sh requirements.txt .venv
   for APP in $APPS; do
     test -n "$APP"

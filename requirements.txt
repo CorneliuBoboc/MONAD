@@ -1,1 +1,1 @@
-requirements.lock_onlymlx.txt
+requirements.lock_all.txt
