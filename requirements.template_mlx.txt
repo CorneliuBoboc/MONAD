@@ -1,4 +1,6 @@
-#faster-whisper
-#openai-whisper
-whispermlx
+whispermlx==3.14.*
+torch==2.8.*
+torchaudio==2.8.*
+torchcodec==0.7.*
+torchvision==0.23.*
 pyannote-audio

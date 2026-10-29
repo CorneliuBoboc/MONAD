@@ -62,6 +62,7 @@ launch_apps() {
   bash resolve_install.sh requirements.txt .venv
   mv requirements.lock.txt requirements.lock_base.txt
   bash resolve_install.sh requirements.template_whisper.txt .venv
+  pip check
   source .venv/bin/activate
   for APP in $APPS; do
     test -n "$APP"
