@@ -1,1 +1,6 @@
 whispermlx==3.14.*
+pyannote-audio==4.0.*
+torch==2.8.*
+torchaudio==2.8.*
+torchcodec==0.7.*
+torchvision==0.23.*
