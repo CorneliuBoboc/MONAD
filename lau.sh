@@ -13,7 +13,7 @@ echo "$OS"|grep -q "^Linux$" && DEMO=true
 $DEMO && VER="3.12"
 $DEMO && APPS=diarix
 ENGINE=mlx
-#$DEMO && ENGINE=openai
+#$DEMO && ENGINE=faster
 
 test -n "$APPS"
 test -n "$DEMO"
