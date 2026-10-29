@@ -1,1 +1,1 @@
-openai-whisper
+openai-whisper torch==2.8.0
