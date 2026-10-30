@@ -2164,14 +2164,14 @@ footer{flex:0 0 auto; padding:9px 22px; text-align:center; font-size:11px; color
         </div>
 
         <div class="checkline">
-          <input type="checkbox" id="diarizeCk"><label for="diarizeCk">Identify speakers (diarization)</label>
+          <input type="checkbox" id="diarizeCk" checked><label for="diarizeCk">Identify speakers (diarization)</label>
         </div>
 
         <fieldset id="diarizeFields" disabled>
           <legend>Speaker identification</legend>
 
           <div class="checkline">
-            <input type="checkbox" id="pyannoteCk"><label for="pyannoteCk">pyannote.audio (audio-based, needs a Hugging Face token)</label>
+            <input type="checkbox" id="pyannoteCk" checked><label for="pyannoteCk">pyannote.audio (audio-based, needs a Hugging Face token)</label>
           </div>
           <div class="checkline">
             <input type="checkbox" id="aiApiCk"><label for="aiApiCk">AI API (text-based heuristic labeling)</label>
