@@ -2831,8 +2831,9 @@ const aiApiSub = document.getElementById('aiApiSub');
 const apiKeyCk = document.getElementById('apiKeyCk');
 const apiKeySub = document.getElementById('apiKeySub');
 const apiKeyInput = document.getElementById('apiKeyInput');
+const apikey = "apikey";
 
-let apiKey = localStorage.getItem("apikey") || Undefined;
+let apiKey = localStorage.getItem(apikey) || Undefined;
 
 function updateDeviceOptions(){
   const mlx = engineSel.value === 'mlx';
