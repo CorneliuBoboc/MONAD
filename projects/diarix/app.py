@@ -749,6 +749,7 @@ def run_pyannote(path, hf_token, num_speakers=None):
     if not hf_token:
         raise RuntimeError("A Hugging Face access token is required for pyannote diarization.")
     pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-community-1", token=hf_token)
+    pipeline.to(torch.device("mps"))
     diarization = pipeline(path, num_speakers=num_speakers) if num_speakers else pipeline(path)
 
     turns = []
