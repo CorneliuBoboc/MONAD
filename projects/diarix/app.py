@@ -2868,7 +2868,7 @@ function updateDiarizeUI(){
   apiKeyCk.checked = needsKey;
   apiKeySub.classList.toggle('hidden', !needsKey);
   apiKeyInput.placeholder = pyannoteCk.checked ? 'Hugging Face access token' : 'Provider API key';
-  if (apikey)
+  if (apiKey)
     apiKeyInput.value = apiKey.trim();
 }
 updateDiarizeUI();
@@ -2882,6 +2882,7 @@ document.getElementById('transcribeBtn').addEventListener('click', async ()=>{
   if(diarize && (pyannoteCk.checked || aiApiCk.checked) && !apiKeyInput.value.trim()){
     toast('An API key / token is required for the selected diarization method.'); return;
   }
+  apiKey = apiKeyInput.value.trim();
   localStorage.setItem(apikey, apiKey);
 
   const payload = {
