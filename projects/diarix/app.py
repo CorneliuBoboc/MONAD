@@ -2834,6 +2834,9 @@ const apiKeyInput = document.getElementById('apiKeyInput');
 const apikey = "apikey";
 
 let apiKey = localStorage.getItem(apikey) || Undefined;
+if (apiKey) {
+  apiKeyInput.value = apiKey.trim();
+}
 
 function updateDeviceOptions(){
   const mlx = engineSel.value === 'mlx';
