@@ -2133,9 +2133,9 @@ footer{flex:0 0 auto; padding:9px 22px; text-align:center; font-size:11px; color
             <select id="langSel">
               <option value="auto">Auto detect</option>
               <option value="de">German</option>
-              <option value="en" selected>English</option>
+              <option value="en">English</option>
               <option value="fr">French</option>
-              <option value="ro">Romanian</option>
+              <option value="ro" selected>Romanian</option>
             </select>
           </div>
           <div class="field">
@@ -2151,9 +2151,9 @@ footer{flex:0 0 auto; padding:9px 22px; text-align:center; font-size:11px; color
             <select id="modelSel">
               <option value="tiny">tiny</option>
               <option value="base">base</option>
-              <option value="small" selected>small</option>
+              <option value="small">small</option>
               <option value="medium">medium</option>
-              <option value="large-v3">large-v3</option>
+              <option value="large-v3" selected>large-v3</option>
             </select>
           </div>
         </div>
