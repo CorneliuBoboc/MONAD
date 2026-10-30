@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import torch
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import wraps
@@ -749,6 +750,11 @@ def run_pyannote(path, hf_token, num_speakers=None):
     if not hf_token:
         raise RuntimeError("A Hugging Face access token is required for pyannote diarization.")
     pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-community-1", token=hf_token)
+    try:
+        if torch.backends.mps.is_available():
+            pipeline.to(torch.device("mps"))
+    except Exception as exc:
+        logging.exception(f"Error: {exc}")
     diarization = pipeline(path, num_speakers=num_speakers) if num_speakers else pipeline(path)
 
     turns = []
@@ -2122,9 +2128,9 @@ footer{flex:0 0 auto; padding:9px 22px; text-align:center; font-size:11px; color
           <div class="field">
             <label for="engineSel">Engine</label>
             <select id="engineSel">
-              <option value="mlx">whispermlx (Apple Silicon)</option>
               <option value="openai-whisper">openai-whisper</option>
               <option value="faster">faster-whisper</option>
+              <option value="mlx" selected>whispermlx (Apple Silicon)</option>
             </select>
           </div>
           <div class="field">
@@ -2132,9 +2138,9 @@ footer{flex:0 0 auto; padding:9px 22px; text-align:center; font-size:11px; color
             <select id="langSel">
               <option value="auto">Auto detect</option>
               <option value="de">German</option>
-              <option value="en" selected>English</option>
+              <option value="en">English</option>
               <option value="fr">French</option>
-              <option value="ro">Romanian</option>
+              <option value="ro" selected>Romanian</option>
             </select>
           </div>
           <div class="field">
@@ -2150,22 +2156,22 @@ footer{flex:0 0 auto; padding:9px 22px; text-align:center; font-size:11px; color
             <select id="modelSel">
               <option value="tiny">tiny</option>
               <option value="base">base</option>
-              <option value="small" selected>small</option>
+              <option value="small">small</option>
               <option value="medium">medium</option>
-              <option value="large-v3">large-v3</option>
+              <option value="large-v3" selected>large-v3</option>
             </select>
           </div>
         </div>
 
         <div class="checkline">
-          <input type="checkbox" id="diarizeCk"><label for="diarizeCk">Identify speakers (diarization)</label>
+          <input type="checkbox" id="diarizeCk" checked><label for="diarizeCk">Identify speakers (diarization)</label>
         </div>
 
-        <fieldset id="diarizeFields" disabled>
+        <fieldset id="diarizeFields" enabled>
           <legend>Speaker identification</legend>
 
           <div class="checkline">
-            <input type="checkbox" id="pyannoteCk"><label for="pyannoteCk">pyannote.audio (audio-based, needs a Hugging Face token)</label>
+            <input type="checkbox" id="pyannoteCk" checked><label for="pyannoteCk">pyannote.audio (audio-based, needs a Hugging Face token)</label>
           </div>
           <div class="checkline">
             <input type="checkbox" id="aiApiCk"><label for="aiApiCk">AI API (text-based heuristic labeling)</label>
@@ -2183,8 +2189,9 @@ footer{flex:0 0 auto; padding:9px 22px; text-align:center; font-size:11px; color
           <div class="checkline">
             <input type="checkbox" id="apiKeyCk" disabled><label for="apiKeyCk">API key</label>
           </div>
-          <div class="subrow hidden" id="apiKeySub">
+          <div class="subrow hidden" id="apiKeySub" style="display:flex; flex-direction:row">
             <input type="password" id="apiKeyInput" placeholder="Paste key or token">
+            <button class="btn" id="apiKeyClear" onClick="apiKeyClear()">Clear API key</button>
           </div>
         </fieldset>
 
@@ -2825,6 +2832,17 @@ const aiApiSub = document.getElementById('aiApiSub');
 const apiKeyCk = document.getElementById('apiKeyCk');
 const apiKeySub = document.getElementById('apiKeySub');
 const apiKeyInput = document.getElementById('apiKeyInput');
+const apikey = "apikey";
+
+function apiKeyClear() {
+  localStorage.removeItem(apikey);
+  apiKeyInput.value = "";
+}
+
+let apiKey = localStorage.getItem(apikey);
+if (apiKey) {
+  apiKeyInput.value = apiKey.trim();
+}
 
 function updateDeviceOptions(){
   const mlx = engineSel.value === 'mlx';
@@ -2860,6 +2878,8 @@ function updateDiarizeUI(){
   apiKeyCk.checked = needsKey;
   apiKeySub.classList.toggle('hidden', !needsKey);
   apiKeyInput.placeholder = pyannoteCk.checked ? 'Hugging Face access token' : 'Provider API key';
+  if (apiKey)
+    apiKeyInput.value = apiKey.trim();
 }
 updateDiarizeUI();
 
@@ -2872,6 +2892,8 @@ document.getElementById('transcribeBtn').addEventListener('click', async ()=>{
   if(diarize && (pyannoteCk.checked || aiApiCk.checked) && !apiKeyInput.value.trim()){
     toast('An API key / token is required for the selected diarization method.'); return;
   }
+  apiKey = apiKeyInput.value.trim();
+  localStorage.setItem(apikey, apiKey);
 
   const payload = {
     engine: engineSel.value,

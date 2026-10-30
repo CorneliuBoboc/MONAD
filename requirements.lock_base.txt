@@ -31,8 +31,8 @@ psutil==7.2.2
 pyasn1==0.6.5
 pyasn1_modules==0.4.2
 pycparser==3.12
-pydantic==2.14.1
-pydantic_core==2.50.1
+pydantic==2.14.2
+pydantic_core==2.50.2
 pymupdf4llm==2.0
 pymupdf==2.0
 pymupdf_layout==2.0
