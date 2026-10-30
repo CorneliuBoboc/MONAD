@@ -742,26 +742,43 @@ def run_multifile_transcriptions(
 # diarization
 # --------------------------------------------------------------------------
 
+_PYANNOTE_PIPELINES = {}
+_PYANNOTE_LOCK = threading.Lock()
+_PYANNOTE_GATE = threading.Lock()  # serialize pipeline.__call__ — pipeline isn't thread-safe
+
+
+def _get_pyannote_pipeline(hf_token):
+    key = hf_token
+    with _PYANNOTE_LOCK:
+        pipe = _PYANNOTE_PIPELINES.get(key)
+        if pipe is not None:
+            return pipe
+        try:
+            from pyannote.audio import Pipeline
+        except ImportError:
+            raise RuntimeError("pyannote.audio is not installed on the server (pip install pyannote.audio).")
+        if not hf_token:
+            raise RuntimeError("A Hugging Face access token is required for pyannote diarization.")
+        pipe = Pipeline.from_pretrained("pyannote/speaker-diarization-community-1", token=hf_token)
+        try:
+            if torch.backends.mps.is_available():
+                pipe.to(torch.device("mps"))
+        except Exception as exc:
+            logging.exception(f"Error: {exc}")
+        _PYANNOTE_PIPELINES[key] = pipe
+        return pipe
+
+
 def run_pyannote(path, hf_token, num_speakers=None):
-    try:
-        from pyannote.audio import Pipeline
-    except ImportError:
-        raise RuntimeError("pyannote.audio is not installed on the server (pip install pyannote.audio).")
-    if not hf_token:
-        raise RuntimeError("A Hugging Face access token is required for pyannote diarization.")
-    pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-community-1", token=hf_token)
-    try:
-        if torch.backends.mps.is_available():
-            pipeline.to(torch.device("mps"))
-    except Exception as exc:
-        logging.exception(f"Error: {exc}")
-    diarization = pipeline(path, num_speakers=num_speakers) if num_speakers else pipeline(path)
+    pipeline = _get_pyannote_pipeline(hf_token)
+    # The pyannote pipeline is stateful; guard inference to avoid concurrent calls.
+    with _PYANNOTE_GATE:
+        diarization = pipeline(path, num_speakers=num_speakers) if num_speakers else pipeline(path)
 
     turns = []
     for turn, speaker in diarization.speaker_diarization:
         turns.append({"start": turn.start, "end": turn.end, "speaker": speaker})
     return turns
-
 
 def assign_speakers_from_turns(segments, turns):
     if not turns:
@@ -3137,44 +3154,3 @@ document.getElementById('downloadZipBtnMulti').addEventListener('click', ()=>{
 if __name__ == "__main__":
     # threaded=True so status polling works while a transcription request runs.
     app.run(debug=True, host="0.0.0.0", port=5030, threaded=True)
-# --------------------------------------------------------------------------
-# diarization
-# --------------------------------------------------------------------------
-
-_PYANNOTE_PIPELINES = {}
-_PYANNOTE_LOCK = threading.Lock()
-_PYANNOTE_GATE = threading.Lock()  # serialize pipeline.__call__ — pipeline isn't thread-safe
-
-
-def _get_pyannote_pipeline(hf_token):
-    key = hf_token
-    with _PYANNOTE_LOCK:
-        pipe = _PYANNOTE_PIPELINES.get(key)
-        if pipe is not None:
-            return pipe
-        try:
-            from pyannote.audio import Pipeline
-        except ImportError:
-            raise RuntimeError("pyannote.audio is not installed on the server (pip install pyannote.audio).")
-        if not hf_token:
-            raise RuntimeError("A Hugging Face access token is required for pyannote diarization.")
-        pipe = Pipeline.from_pretrained("pyannote/speaker-diarization-community-1", token=hf_token)
-        try:
-            if torch.backends.mps.is_available():
-                pipe.to(torch.device("mps"))
-        except Exception as exc:
-            logging.exception(f"Error: {exc}")
-        _PYANNOTE_PIPELINES[key] = pipe
-        return pipe
-
-
-def run_pyannote(path, hf_token, num_speakers=None):
-    pipeline = _get_pyannote_pipeline(hf_token)
-    # The pyannote pipeline is stateful; guard inference to avoid concurrent calls.
-    with _PYANNOTE_GATE:
-        diarization = pipeline(path, num_speakers=num_speakers) if num_speakers else pipeline(path)
-
-    turns = []
-    for turn, speaker in diarization.speaker_diarization:
-        turns.append({"start": turn.start, "end": turn.end, "speaker": speaker})
-    return turns
