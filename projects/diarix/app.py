@@ -2167,7 +2167,7 @@ footer{flex:0 0 auto; padding:9px 22px; text-align:center; font-size:11px; color
           <input type="checkbox" id="diarizeCk" checked><label for="diarizeCk">Identify speakers (diarization)</label>
         </div>
 
-        <fieldset id="diarizeFields" disabled>
+        <fieldset id="diarizeFields" enabled>
           <legend>Speaker identification</legend>
 
           <div class="checkline">
