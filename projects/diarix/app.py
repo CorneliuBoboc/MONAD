@@ -752,7 +752,7 @@ def run_pyannote(path, hf_token, num_speakers=None):
     try:
         pipeline.to(torch.device("mps"))
     except Exception as exc:
-        pass
+        logging.exception(f"Error: {exc}")
     diarization = pipeline(path, num_speakers=num_speakers) if num_speakers else pipeline(path)
 
     turns = []
@@ -2126,9 +2126,9 @@ footer{flex:0 0 auto; padding:9px 22px; text-align:center; font-size:11px; color
           <div class="field">
             <label for="engineSel">Engine</label>
             <select id="engineSel">
-              <option value="mlx">whispermlx (Apple Silicon)</option>
               <option value="openai-whisper">openai-whisper</option>
               <option value="faster">faster-whisper</option>
+              <option value="mlx" selected>whispermlx (Apple Silicon)</option>
             </select>
           </div>
           <div class="field">
