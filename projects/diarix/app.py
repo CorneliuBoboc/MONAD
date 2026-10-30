@@ -751,7 +751,8 @@ def run_pyannote(path, hf_token, num_speakers=None):
         raise RuntimeError("A Hugging Face access token is required for pyannote diarization.")
     pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-community-1", token=hf_token)
     try:
-        pipeline.to(torch.device("mps"))
+        if torch.backends.mps.is_available():
+            pipeline.to(torch.device("mps"))
     except Exception as exc:
         logging.exception(f"Error: {exc}")
     diarization = pipeline(path, num_speakers=num_speakers) if num_speakers else pipeline(path)
