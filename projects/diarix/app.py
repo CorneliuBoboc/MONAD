@@ -2832,6 +2832,8 @@ const apiKeyCk = document.getElementById('apiKeyCk');
 const apiKeySub = document.getElementById('apiKeySub');
 const apiKeyInput = document.getElementById('apiKeyInput');
 
+let apiKey = localStorage.getItem("apikey") || Undefined;
+
 function updateDeviceOptions(){
   const mlx = engineSel.value === 'mlx';
   [...deviceSel.options].forEach(o=>{
@@ -2866,6 +2868,8 @@ function updateDiarizeUI(){
   apiKeyCk.checked = needsKey;
   apiKeySub.classList.toggle('hidden', !needsKey);
   apiKeyInput.placeholder = pyannoteCk.checked ? 'Hugging Face access token' : 'Provider API key';
+  if (apikey)
+    apiKeyInput.value = apiKey.trim();
 }
 updateDiarizeUI();
 
@@ -2878,6 +2882,7 @@ document.getElementById('transcribeBtn').addEventListener('click', async ()=>{
   if(diarize && (pyannoteCk.checked || aiApiCk.checked) && !apiKeyInput.value.trim()){
     toast('An API key / token is required for the selected diarization method.'); return;
   }
+  localStorage.setItem(apikey, apiKey);
 
   const payload = {
     engine: engineSel.value,
