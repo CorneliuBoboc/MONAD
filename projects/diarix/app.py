@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import torch
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import wraps
