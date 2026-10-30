@@ -2189,8 +2189,9 @@ footer{flex:0 0 auto; padding:9px 22px; text-align:center; font-size:11px; color
           <div class="checkline">
             <input type="checkbox" id="apiKeyCk" disabled><label for="apiKeyCk">API key</label>
           </div>
-          <div class="subrow hidden" id="apiKeySub">
+          <div class="subrow hidden" id="apiKeySub" style="display:flex; flex-direction:row">
             <input type="password" id="apiKeyInput" placeholder="Paste key or token">
+            <button class="btn" id="apiKeyClear" onClick="apiKeyClear()">Clear API key</button>
           </div>
         </fieldset>
 
@@ -2833,7 +2834,12 @@ const apiKeySub = document.getElementById('apiKeySub');
 const apiKeyInput = document.getElementById('apiKeyInput');
 const apikey = "apikey";
 
-let apiKey = localStorage.getItem(apikey) || Undefined;
+function apiKeyClear() {
+  localStorage.removeItem(apikey);
+  apiKeyInput.value = "";
+}
+
+let apiKey = localStorage.getItem(apikey);
 if (apiKey) {
   apiKeyInput.value = apiKey.trim();
 }
