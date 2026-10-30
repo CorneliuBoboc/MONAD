@@ -2965,7 +2965,7 @@ document.getElementById('transcribeBtn').addEventListener('click', async ()=>{
           if (outcome.error) throw outcome.error;
           break;
         }
-        await new Promise(resolve => setTimeout(resolve, 500));
+        await new Promise(resolve => setTimeout(resolve, 30000));
       }
 
       const outcome = await transcriptionRequest;
