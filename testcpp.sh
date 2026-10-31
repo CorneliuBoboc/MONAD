@@ -62,7 +62,7 @@ fi
 
 cd "$APP_DIR"
 nohup "$PYTHON" -c \
-    'import app; app.app.run(host="0.0.0.0", port=5030, threaded=True, use_reloader=False)' \
+    'import app; app.app.run(host="0.0.0.0", port=5029, threaded=True, use_reloader=False)' \
     >"$LOG_FILE" 2>&1 </dev/null &
 APP_PID=$!
 
