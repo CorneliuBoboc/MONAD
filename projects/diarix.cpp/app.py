@@ -3162,4 +3162,4 @@ document.getElementById('downloadZipBtnMulti').addEventListener('click', ()=>{
 
 if __name__ == "__main__":
     # threaded=True so status polling works while a transcription request runs.
-    app.run(debug=True, host="0.0.0.0", port=5030, threaded=True)
+    app.run(debug=True, host="0.0.0.0", port=5029, threaded=True)
