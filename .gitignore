@@ -1,3 +1,4 @@
 spec.md
 projects/vd/data
 .venv
+.venv-cpp
