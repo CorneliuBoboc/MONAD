@@ -11,9 +11,9 @@ VER="3.12"
 DEMO=false
 echo "$OS"|grep -q "^Linux$" && DEMO=true
 $DEMO && VER="3.12"
-$DEMO && APPS=diarix
+#$DEMO && APPS=diarix
 ENGINE=mlx
-$DEMO && ENGINE=faster
+#$DEMO && ENGINE=faster
 $DEMO || DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/opt/ffmpeg@7/lib
 
 test -n "$APPS"
