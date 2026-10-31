@@ -47,7 +47,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s: %(message)s",
 )
 
-BASE_DIR = os.path.join(tempfile.gettempdir(), "media_editor_sessions")
+BASE_DIR = os.path.join(tempfile.gettempdir(), "media_editor_sessions.cpp")
 
 # In-memory workspace registry: sid -> {dir, source, chunks, transcript, segments, ...}
 SESSIONS = {}
