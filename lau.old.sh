@@ -5,7 +5,7 @@ set -e
 APPS="$(ls projects)"
 ARG="$1"
 OS="$(uname)"
-PORTS="5030 5034"
+PORTS="5029 5030 5034"
 VER="3.12"
 
 DEMO=false
