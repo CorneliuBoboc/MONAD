@@ -1,4 +1,5 @@
 #! /usr/bin/env bash
 
-bash lau.old.sh --cold
+bash lau.old.sh $@
+bash laucpp.sh &
 
