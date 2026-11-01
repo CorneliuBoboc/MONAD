@@ -2018,6 +2018,13 @@ textarea#transcriptOut{flex:1; min-height:220px; resize:vertical; font-family:va
   min-height:160px; resize:vertical; font-family:var(--font-mono); font-size:12.5px; line-height:1.6;
 }
 
+.transcription-progress{display:flex; flex-direction:column; gap:8px; padding:10px 24px 0;}
+.transcription-progress-label{font-size:12.5px; color:var(--text-dim);}
+.progress-track{height:8px; overflow:hidden; border-radius:999px; background:var(--panel-2);}
+.progress-fill{height:100%; width:0; border-radius:inherit; background:var(--amber); transition:width .25s ease;}
+.progress-fill.indeterminate{width:35%; animation:progress-slide 1.4s ease-in-out infinite alternate;}
+@keyframes progress-slide{from{transform:translateX(0);}to{transform:translateX(185%);}}
+
 .toast{
   position:fixed; bottom:18px; left:50%; transform:translateX(-50%) translateY(10px);
   background:#20120f; border:1px solid var(--red); color:#ffd8d6; padding:11px 18px;
@@ -2057,6 +2064,13 @@ footer{flex:0 0 auto; padding:9px 22px; text-align:center; font-size:11px; color
         <button class="tab-btn" data-tab="cut" disabled><span class="eyebrow">02</span>Preview &amp; cut</button>
         <button class="tab-btn" data-tab="transcribe" disabled><span class="eyebrow">03</span>Transcription</button>
         <button class="tab-btn" data-tab="extract" disabled><span class="eyebrow">04</span>Results</button>
+      </div>
+      <div id="transcriptionProgress" class="transcription-progress hidden" aria-live="polite">
+        <div id="transcriptionProgressLabel" class="transcription-progress-label"></div>
+        <div class="progress-track" role="progressbar" aria-label="Transcription progress"
+             aria-valuemin="0" aria-valuemax="100">
+          <div id="transcriptionProgressBar" class="progress-fill"></div>
+        </div>
       </div>
 
       <!-- TAB 1: load media -->
@@ -2909,6 +2923,45 @@ function updateDiarizeUI(){
 }
 updateDiarizeUI();
 
+function updateTranscriptionProgress(status){
+  const container = document.getElementById('transcriptionProgress');
+  const label = document.getElementById('transcriptionProgressLabel');
+  const bar = document.getElementById('transcriptionProgressBar');
+  const track = bar.parentElement;
+  if (!status || status.state === 'idle') {
+    container.classList.add('hidden');
+    return;
+  }
+
+  container.classList.remove('hidden');
+  const total = Number(status.total) || 0;
+  const completed = Number(status.completed) || 0;
+  if (status.state === 'running') {
+    if (total > 1) {
+      const percent = Math.min(100, Math.round(completed / total * 100));
+      label.textContent = `Transcribing: ${completed} of ${total} files complete`;
+      bar.classList.remove('indeterminate');
+      bar.style.width = `${percent}%`;
+      track.setAttribute('aria-valuenow', String(percent));
+    } else {
+      label.textContent = 'Transcribing…';
+      bar.classList.add('indeterminate');
+      bar.style.width = '';
+      track.removeAttribute('aria-valuenow');
+    }
+  } else if (status.state === 'complete') {
+    label.textContent = 'Transcription complete';
+    bar.classList.remove('indeterminate');
+    bar.style.width = '100%';
+    track.setAttribute('aria-valuenow', '100');
+  } else if (status.state === 'failed') {
+    label.textContent = 'Transcription stopped';
+    bar.classList.remove('indeterminate');
+    bar.style.width = total > 1 ? `${Math.min(100, Math.round(completed / total * 100))}%` : '0%';
+    track.setAttribute('aria-valuenow', String(total > 1 ? Math.min(100, Math.round(completed / total * 100)) : 0));
+  }
+}
+
 document.getElementById('transcribeBtn').addEventListener('click', async ()=>{
   const btn = document.getElementById('transcribeBtn');
   const diarize = diarizeCk.checked;
@@ -2943,14 +2996,20 @@ document.getElementById('transcribeBtn').addEventListener('click', async ()=>{
       renderMultiTranscriptions(state.transcriptions, {
         state:'running', completed:0, total:state.fileCount,
       });
-      let requestSettled = false;
-      const transcriptionRequest = api('/api/transcribe', requestOptions)
-        .then(data => ({data}), error => ({error}))
-        .finally(() => { requestSettled = true; });
+    }
+    updateTranscriptionProgress({
+      state:'running', completed:0, total:state.multifile ? state.fileCount : 1,
+    });
+    let requestSettled = false;
+    const transcriptionRequest = api('/api/transcribe', requestOptions)
+      .then(data => ({data}), error => ({error}))
+      .finally(() => { requestSettled = true; });
 
-      let lastCount = -1;
-      while (true) {
-        const progress = await api('/api/transcribe/status');
+    let lastCount = -1;
+    while (true) {
+      const progress = await api('/api/transcribe/status');
+      updateTranscriptionProgress(progress.status);
+      if (state.multifile) {
         const items = progress.transcriptions || [];
         if (items.length !== lastCount) {
           state.transcriptions = items;
@@ -2959,23 +3018,21 @@ document.getElementById('transcribeBtn').addEventListener('click', async ()=>{
         } else {
           updateMultiTranscriptionStatus(progress.status);
         }
-        if (progress.status.state === 'complete' || progress.status.state === 'failed') break;
-        if (requestSettled && progress.status.state === 'idle') {
-          const outcome = await transcriptionRequest;
-          if (outcome.error) throw outcome.error;
-          break;
-        }
-        await new Promise(resolve => setTimeout(resolve, 30000));
       }
+      if (progress.status.state === 'complete' || progress.status.state === 'failed') break;
+      if (requestSettled && progress.status.state === 'idle') break;
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
 
-      const outcome = await transcriptionRequest;
-      if (outcome.error) throw outcome.error;
+    const outcome = await transcriptionRequest;
+    if (outcome.error) throw outcome.error;
+    if (state.multifile) {
       state.transcriptions = outcome.data.transcriptions || [];
       renderMultiTranscriptions(state.transcriptions, {
         state:'complete', completed:state.transcriptions.length, total:state.transcriptions.length,
       });
     } else {
-      const data = await api('/api/transcribe', requestOptions);
+      const data = outcome.data;
       state.transcriptions = [];
       state.segments = data.segments;
       document.getElementById('transcriptOut').value = data.transcript;
