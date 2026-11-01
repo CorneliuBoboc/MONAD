@@ -70,7 +70,7 @@ mlx)
   pip install "whispermlx==3.14.0" "pyannote.audio==4.0.7" "torch==2.8.0" "torchaudio==2.8.0" "torchcodec==0.7.0" "torchvision==0.23.0"
   ;;
 openai)
-  pip install "openai-whisper", "pyannote.audio"
+  pip install "openai-whisper" "pyannote.audio"
   ;;
 *)
   exit 11
