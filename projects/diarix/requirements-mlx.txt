@@ -1,2 +1,0 @@
-# requirements-mlx.txt
-whispermlx
