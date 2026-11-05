@@ -30,8 +30,6 @@ if ! command -v ffmpeg >/dev/null 2>&1; then
     exit 1
 fi
 
-pkill -kill $PYTHON
-
 export WHISPER_CPP_DIR WHISPER_CPP_MODEL_DIR WHISPER_CPP_BIN
 
 $PYTHON $APP_DIR/app.py &>$LOG_FILE &
