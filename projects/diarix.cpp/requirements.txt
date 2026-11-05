@@ -1,6 +1,5 @@
 requests
 flask
 yt-dlp
-google-genai
 pyannote-audio
 torch

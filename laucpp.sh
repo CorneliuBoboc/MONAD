@@ -99,11 +99,15 @@ cd $HOME/code/*/monad
 #python -m venv .venv-cpp
 . .venv-cpp/bin/activate
 #python -m pip install --upgrade pip
-reqfile=projects/diarix.cpp/requirements.txt
+reqfile="projects/diarix.cpp/requirements.txt"
 nreq=$(cat $reqfile|wc -l)
-nf=6
+nf=5
+echo range $nf $nreq
 for n in $(seq $nf $nreq); do
-    r=$(cat $reqfile|head -n $n|tail -n 1)
+    echo n=$n
+    cat $reqfile | head -n $n >/tmp/tmp
+    r=$(tail -n 1 /tmp/tmp)
+    echo req $r
     pip install $r
 done
 pip check
