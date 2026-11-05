@@ -102,7 +102,7 @@ python -m pip install --upgrade pip
 reqfile=projects/diarix.cpp/requirements.txt
 nreq=$(cat $reqfile|wc -l)
 for n in $(seq 1 $nreq); do
-    r=$(cat $reqfile|head -n $nreq|tail -n 1)
+    r=$(cat $reqfile|head -n $n|tail -n 1)
     pip install $r
 done
 python -m pip check
