@@ -98,14 +98,15 @@ cd $HOME/code/*/monad
 #rm -rf .venv-cpp
 #python -m venv .venv-cpp
 . .venv-cpp/bin/activate
-python -m pip install --upgrade pip
+#python -m pip install --upgrade pip
 reqfile=projects/diarix.cpp/requirements.txt
 nreq=$(cat $reqfile|wc -l)
-for n in $(seq 1 $nreq); do
+nf=6
+for n in $(seq $nf $nreq); do
     r=$(cat $reqfile|head -n $n|tail -n 1)
     pip install $r
 done
-python -m pip check
+pip check
 
 export WHISPER_CPP_DIR WHISPER_CPP_MODEL_DIR WHISPER_CPP_BIN
 echo "Starting diarix.cpp..."
