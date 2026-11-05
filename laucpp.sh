@@ -105,7 +105,7 @@ nf=1
 for n in $(seq $nf $nreq); do
     cat $reqfile | head -n $n >/tmp/tmp
     r=$(tail -n 1 /tmp/tmp)
-    pip show $r || pip install -q $r
+    pip show $r || pip install $r
 done
 pip check
 
