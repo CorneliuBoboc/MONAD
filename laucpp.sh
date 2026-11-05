@@ -112,6 +112,7 @@ if [[ ! -x "$VENV_DIR/bin/python" ]]; then
     "$PYTHON_BIN" -m venv "$VENV_DIR"
 fi
 
+"$VENV_DIR/bin/python" -m pip install --upgrade pip
 "$VENV_DIR/bin/python" -m pip install -r "$ROOT_DIR/projects/diarix.cpp/requirements.txt"
 "$VENV_DIR/bin/python" -m pip check
 
