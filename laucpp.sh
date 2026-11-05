@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 
-set -euo pipefail
+set -e
 
-ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR=$PWD
 WHISPER_CPP_URL="https://github.com/Danielzapirtan/whisper.cpp.git"
 WHISPER_CPP_BRANCH="Danielzapirtan"
 WHISPER_CPP_DIR="${WHISPER_CPP_DIR:-$HOME/code/Danielzapirtan/whisper.cpp}"
@@ -94,25 +94,18 @@ if [[ ! -s "$model_path" ]]; then
     exit 1
 fi
 
-cd $HOME/code/*/monad
-#rm -rf .venv-cpp
-#python -m venv .venv-cpp
+cd $ROOT_DIR
+rm -rf .venv-cpp
+python -m venv .venv-cpp
 . .venv-cpp/bin/activate
-#python -m pip install --upgrade pip
+python -m pip install --upgrade pip
 reqfile="projects/diarix.cpp/requirements.txt"
 nreq=$(cat $reqfile|wc -l)
 nf=1
-echo range $nf $nreq
 for n in $(seq $nf $nreq); do
-    echo n=$n
     cat $reqfile | head -n $n >/tmp/tmp
     r=$(tail -n 1 /tmp/tmp)
-    echo req $r
-    if pip show $r; then
-	    echo "package $r already installed"
-    else	   
-	    pip install $r
-    fi
+    pip show $r || pip install -q $r
 done
 pip check
 
