@@ -33,4 +33,5 @@ fi
 export WHISPER_CPP_DIR WHISPER_CPP_MODEL_DIR WHISPER_CPP_BIN
 
 $PYTHON $APP_DIR/app.py &>$LOG_FILE &
-
+echo "Applet diarix.cpp started."
+echo "You can see the log in file $LOG_FILE"
