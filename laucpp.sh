@@ -94,27 +94,18 @@ if [[ ! -s "$model_path" ]]; then
     exit 1
 fi
 
-if [[ -n "${PYTHON:-}" ]]; then
-    PYTHON_BIN="$PYTHON"
-elif command -v python3.12 >/dev/null 2>&1; then
-    PYTHON_BIN="$(command -v python3.12)"
-elif command -v python3.13 >/dev/null 2>&1; then
-    PYTHON_BIN="$(command -v python3.13)"
-elif command -v python3 >/dev/null 2>&1; then
-    PYTHON_BIN="$(command -v python3)"
-else
-    echo "Error: Python 3.12 or newer is required." >&2
-    exit 1
-fi
-
-"$PYTHON_BIN" -c 'import sys; sys.version_info >= (3, 12) or sys.exit("Python 3.12 or newer is required.")'
-if [[ ! -x "$VENV_DIR/bin/python" ]]; then
-    "$PYTHON_BIN" -m venv "$VENV_DIR"
-fi
-
-"$VENV_DIR/bin/python" -m pip install --upgrade pip
-"$VENV_DIR/bin/python" -m pip install -r "$ROOT_DIR/projects/diarix.cpp/requirements.txt"
-"$VENV_DIR/bin/python" -m pip check
+cd $HOME/code/*/monad
+#rm -rf .venv-cpp
+#python -m venv .venv-cpp
+. .venv-cpp/bin/activate
+python -m pip install --upgrade pip
+reqfile=projects/diarix.cpp/requirements.txt
+nreq=$(cat $reqfile|wc -l)
+for n in $(seq 1 $nreq); do
+    r=$(cat $reqfile|head -n $nreq|tail -n 1)
+    pip install $r
+done
+python -m pip check
 
 export WHISPER_CPP_DIR WHISPER_CPP_MODEL_DIR WHISPER_CPP_BIN
 echo "Starting diarix.cpp..."
