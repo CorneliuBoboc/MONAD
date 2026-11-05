@@ -101,14 +101,18 @@ cd $HOME/code/*/monad
 #python -m pip install --upgrade pip
 reqfile="projects/diarix.cpp/requirements.txt"
 nreq=$(cat $reqfile|wc -l)
-nf=5
+nf=1
 echo range $nf $nreq
 for n in $(seq $nf $nreq); do
     echo n=$n
     cat $reqfile | head -n $n >/tmp/tmp
     r=$(tail -n 1 /tmp/tmp)
     echo req $r
-    pip install $r
+    if pip show $r; then
+	    echo "package $r already installed"
+    else	   
+	    pip install $r
+    fi
 done
 pip check
 
