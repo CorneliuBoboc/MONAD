@@ -5,4 +5,4 @@ google-genai
 pyannote-audio
 #faster-whisper
 #openai-whisper
-torch==2.15.0
+torch
