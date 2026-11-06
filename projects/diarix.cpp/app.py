@@ -89,7 +89,7 @@ VALID_LANGUAGES = {"auto", "de", "en", "fr", "ro"}
 def _empty_transcription_status():
     return {
         "state": "idle", "completed": 0, "total": 0, "current_file": None,
-        "file_progress": None, "error": None,
+        "current_file_index": None, "file_progress": None, "error": None,
     }
 
 
@@ -549,13 +549,15 @@ def run_whisper_cpp(path, language, model_size, device, progress_callback=None):
             reader.start()
             output_tail = bytearray()
             progress_tail = b""
-            deadline = time.monotonic() + 1800
+            media_info = probe_media(path)
+            timeout_seconds = max(1800, 3 * media_info["duration"]) if media_info else 1800
+            deadline = time.monotonic() + timeout_seconds
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     process.kill()
                     process.wait()
-                    raise subprocess.TimeoutExpired(cmd, 1800)
+                    raise subprocess.TimeoutExpired(cmd, timeout_seconds)
                 try:
                     chunk = output_queue.get(timeout=min(1, remaining))
                 except queue.Empty:
@@ -726,13 +728,15 @@ def run_multifile_transcriptions(
         try:
             with sess["lock"]:
                 sess["transcription_status"].update(
-                    current_file=f.get("name"), file_progress=None,
+                    current_file=f.get("name"), current_file_index=idx,
+                    file_progress=None,
                 )
 
             def report_progress(percent):
                 with sess["lock"]:
                     sess["transcription_status"].update(
-                        current_file=f.get("name"), file_progress=percent,
+                        current_file=f.get("name"), current_file_index=idx,
+                        file_progress=percent,
                     )
 
             result = transcribe_one_source_file(
@@ -755,6 +759,8 @@ def run_multifile_transcriptions(
         for idx, f in enumerate(source_files):
             idx2, result, exc = work(idx, f)
             consume(idx2, result, exc)
+            if first_error:
+                break
         if first_error:
             raise first_error[0]
         return list(sess["transcriptions"])
@@ -835,8 +841,13 @@ def _get_pyannote_pipeline(hf_token):
             raise RuntimeError("A Hugging Face access token is required for pyannote diarization.")
         pipe = Pipeline.from_pretrained("pyannote/speaker-diarization-community-1", token=hf_token)
         try:
-            if torch.backends.mps.is_available():
-                pipe.to(torch.device("mps"))
+            device = None
+            if torch.cuda.is_available():
+                device = torch.device("cuda")
+            elif torch.backends.mps.is_available():
+                device = torch.device("mps")
+            if device is not None:
+                pipe.to(device)
         except Exception as exc:
             logging.exception(f"Error: {exc}")
         _PYANNOTE_PIPELINES[key] = pipe
@@ -845,9 +856,34 @@ def _get_pyannote_pipeline(hf_token):
 
 def run_pyannote(path, hf_token, num_speakers=None):
     pipeline = _get_pyannote_pipeline(hf_token)
-    # The pyannote pipeline is stateful; guard inference to avoid concurrent calls.
-    with _PYANNOTE_GATE:
-        diarization = pipeline(path, num_speakers=num_speakers) if num_speakers else pipeline(path)
+    with tempfile.TemporaryDirectory(prefix="diarix_pyannote_") as work_dir:
+        pcm_path = os.path.join(work_dir, "audio.s16le")
+        subprocess.run(
+            [
+                "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                "-i", path, "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000",
+                "-c:a", "pcm_s16le", "-f", "s16le", pcm_path,
+            ],
+            capture_output=True, text=True, timeout=600, check=True,
+        )
+        sample_count = os.path.getsize(pcm_path) // 2
+        if sample_count == 0:
+            raise RuntimeError(f"No audio samples found in {path}.")
+        waveform = (
+            torch.from_file(
+                pcm_path, shared=False, size=sample_count, dtype=torch.int16,
+            )
+            .to(torch.float32)
+            .div_(32768)
+            .unsqueeze(0)
+        )
+        audio = {"waveform": waveform, "sample_rate": 16000}
+        # The pyannote pipeline is stateful; guard inference to avoid concurrent calls.
+        with _PYANNOTE_GATE:
+            diarization = (
+                pipeline(audio, num_speakers=num_speakers)
+                if num_speakers else pipeline(audio)
+            )
 
     turns = []
     for turn, speaker in diarization.speaker_diarization:
@@ -3017,6 +3053,8 @@ function updateTranscriptionProgress(status){
   container.classList.remove('hidden');
   const total = Number(status.total) || 0;
   const completed = Number(status.completed) || 0;
+  const activeFileIndex = Number.isInteger(status.current_file_index)
+    ? status.current_file_index : completed;
   if (status.state === 'running') {
     const hasPercent = status.file_progress !== null
       && status.file_progress !== undefined
@@ -3025,7 +3063,7 @@ function updateTranscriptionProgress(status){
       const percent = Math.min(100, Math.max(0, Number(status.file_progress)));
       const file = status.current_file ? `${status.current_file}: ` : '';
       label.textContent = total > 1
-        ? `File ${Math.min(completed + 1, total)} of ${total} | ${file}${percent}%`
+        ? `File ${Math.min(activeFileIndex + 1, total)} of ${total} | ${file}${percent}%`
         : `${file}${percent}%`;
       bar.classList.remove('indeterminate');
       bar.style.width = `${percent}%`;
@@ -3033,7 +3071,7 @@ function updateTranscriptionProgress(status){
     } else {
       const file = status.current_file ? `${status.current_file}: ` : '';
       label.textContent = total > 1
-        ? `File ${Math.min(completed + 1, total)} of ${total} | ${file}Transcribing…`
+        ? `File ${Math.min(activeFileIndex + 1, total)} of ${total} | ${file}Transcribing…`
         : `${file}Transcribing…`;
       bar.classList.add('indeterminate');
       bar.style.width = '';
