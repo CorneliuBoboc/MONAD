@@ -89,7 +89,8 @@ VALID_LANGUAGES = {"auto", "de", "en", "fr", "ro"}
 def _empty_transcription_status():
     return {
         "state": "idle", "completed": 0, "total": 0, "current_file": None,
-        "current_file_index": None, "file_progress": None, "error": None,
+        "current_file_index": None, "stage": None, "file_progress": None,
+        "diarization_step": None, "diarization_progress": None, "error": None,
     }
 
 
@@ -525,6 +526,8 @@ def run_whisper_cpp(path, language, model_size, device, progress_callback=None):
                 "-m", model_path,
                 "-f", wav_path,
                 "-l", language or "auto",
+                # Prevent a hallucinated window from contaminating later windows.
+                "-mc", "0",
                 "-t", str(max(1, min(os.cpu_count() or 4, 8))),
                 "-oj",
                 "-of", output_base,
@@ -665,16 +668,21 @@ def segments_to_transcript(norm_segs):
 
 def apply_diarization_to_segments(
     path, norm_segs, diarize, diarize_method, ai_provider, api_key, num_speakers,
+    progress_callback=None,
 ):
     if not diarize or any(s.get("speaker") for s in norm_segs):
         return norm_segs
     if diarize_method == "pyannote":
-        turns = run_pyannote(path, api_key, num_speakers)
+        turns = run_pyannote(path, api_key, num_speakers, progress_callback)
         assign_speakers_from_turns(norm_segs, turns)
     elif diarize_method == "ai_api":
+        if progress_callback:
+            progress_callback("AI API", 0, 1)
         labels = run_ai_diarization(norm_segs, ai_provider, api_key, num_speakers)
         for seg, label in zip(norm_segs, labels):
             seg["speaker"] = label
+        if progress_callback:
+            progress_callback("AI API", 1, 1)
     else:
         raise RuntimeError("Choose a diarization method (pyannote or AI API).")
     return norm_segs
@@ -684,6 +692,7 @@ def transcribe_one_source_file(
     f, engine, language, device, model_size,
     diarize, diarize_method, ai_provider, api_key, num_speakers,
     engine_override=None, device_override=None, progress_callback=None,
+    diarization_progress_callback=None,
 ):
     """Full per-file pipeline used by multi-file mode."""
     selected_engine = engine_override or engine
@@ -695,6 +704,7 @@ def transcribe_one_source_file(
     norm_segs = normalize_segments(segs)
     apply_diarization_to_segments(
         f["path"], norm_segs, diarize, diarize_method, ai_provider, api_key, num_speakers,
+        progress_callback=diarization_progress_callback,
     )
     text = segments_to_transcript(norm_segs)
     return {"name": f["name"], "id": f.get("id"), "transcript": text, "segments": norm_segs}
@@ -729,20 +739,32 @@ def run_multifile_transcriptions(
             with sess["lock"]:
                 sess["transcription_status"].update(
                     current_file=f.get("name"), current_file_index=idx,
-                    file_progress=None,
+                    stage="transcribing", file_progress=None,
+                    diarization_step=None, diarization_progress=None,
                 )
 
             def report_progress(percent):
                 with sess["lock"]:
                     sess["transcription_status"].update(
                         current_file=f.get("name"), current_file_index=idx,
+                        stage="transcribing",
                         file_progress=percent,
+                    )
+
+            def report_diarization_progress(step, completed, total):
+                percent = min(100, max(0, int(completed * 100 / total))) if total else None
+                with sess["lock"]:
+                    sess["transcription_status"].update(
+                        current_file=f.get("name"), current_file_index=idx,
+                        stage="diarizing", diarization_step=step,
+                        diarization_progress=percent,
                     )
 
             result = transcribe_one_source_file(
                 f, engine, language, device, model_size,
                 diarize, diarize_method, ai_provider, api_key, num_speakers,
                 progress_callback=report_progress,
+                diarization_progress_callback=report_diarization_progress,
             )
             return idx, result, None
         except Exception as exc:
@@ -840,6 +862,10 @@ def _get_pyannote_pipeline(hf_token):
         if not hf_token:
             raise RuntimeError("A Hugging Face access token is required for pyannote diarization.")
         pipe = Pipeline.from_pretrained("pyannote/speaker-diarization-community-1", token=hf_token)
+        batch_size = max(1, min(torch.get_num_threads(), 4))
+        pipe.segmentation_batch_size = batch_size
+        pipe.embedding_batch_size = batch_size
+        app.logger.info("Using pyannote batch size %d.", batch_size)
         try:
             device = None
             if torch.cuda.is_available():
@@ -854,8 +880,10 @@ def _get_pyannote_pipeline(hf_token):
         return pipe
 
 
-def run_pyannote(path, hf_token, num_speakers=None):
+def run_pyannote(path, hf_token, num_speakers=None, progress_callback=None):
     pipeline = _get_pyannote_pipeline(hf_token)
+    if progress_callback:
+        progress_callback("Preparing audio", 0, 1)
     with tempfile.TemporaryDirectory(prefix="diarix_pyannote_") as work_dir:
         pcm_path = os.path.join(work_dir, "audio.s16le")
         subprocess.run(
@@ -878,11 +906,16 @@ def run_pyannote(path, hf_token, num_speakers=None):
             .unsqueeze(0)
         )
         audio = {"waveform": waveform, "sample_rate": 16000}
+
+        def report_progress(step_name, _artifact, file=None, total=None, completed=None):
+            if progress_callback and total and completed is not None:
+                progress_callback(step_name, completed, total)
+
         # The pyannote pipeline is stateful; guard inference to avoid concurrent calls.
         with _PYANNOTE_GATE:
             diarization = (
-                pipeline(audio, num_speakers=num_speakers)
-                if num_speakers else pipeline(audio)
+                pipeline(audio, num_speakers=num_speakers, hook=report_progress)
+                if num_speakers else pipeline(audio, hook=report_progress)
             )
 
     turns = []
@@ -1587,7 +1620,7 @@ def api_transcribe():
         sess["transcript"] = None
         sess["transcription_status"] = {
             **_empty_transcription_status(),
-            "state": "running", "completed": 0,
+            "state": "running", "stage": "transcribing", "completed": 0,
             "total": len(source_files) if is_multifile else 1,
         }
 
@@ -1611,7 +1644,7 @@ def api_transcribe():
 
         with sess["lock"]:
             sess["segments"] = []  # no combined segments in multi-file mode
-            sess["transcription_status"]["state"] = "complete"
+            sess["transcription_status"].update(state="complete", stage="complete")
 
         return jsonify(
             multifile=True,
@@ -1634,14 +1667,16 @@ def api_transcribe():
     )
     with sess["lock"]:
         sess["transcription_status"].update(
-            current_file=current_file, file_progress=None,
+            current_file=current_file, stage="transcribing", file_progress=None,
+            diarization_step=None, diarization_progress=None,
         )
 
     def _transcribe_item(item):
         def report_progress(percent):
             with sess["lock"]:
                 sess["transcription_status"].update(
-                    current_file=current_file, file_progress=percent,
+                    current_file=current_file, stage="transcribing",
+                    file_progress=percent,
                 )
 
         segs = transcribe_file(
@@ -1686,9 +1721,20 @@ def api_transcribe():
     # Handle diarization for non-MLX engines or when MLX didn't provide speakers
     if diarize and not any(s.get("speaker") for s in all_segments):
         try:
+            def report_diarization_progress(step, completed, total):
+                percent = min(100, max(0, int(completed * 100 / total))) if total else None
+                with sess["lock"]:
+                    sess["transcription_status"].update(
+                        stage="diarizing", diarization_step=step,
+                        diarization_progress=percent,
+                    )
+
             if diarize_method == "pyannote":
                 def _diarize_item(item):
-                    t = run_pyannote(item["path"], api_key, num_speakers)
+                    t = run_pyannote(
+                        item["path"], api_key, num_speakers,
+                        progress_callback=report_diarization_progress,
+                    )
                     off = item.get("start", 0.0)
                     return [
                         {"start": x["start"] + off, "end": x["end"] + off, "speaker": x["speaker"]}
@@ -1740,7 +1786,9 @@ def api_transcribe():
     sess["segments"] = all_segments
     sess["transcriptions"] = []
     with sess["lock"]:
-        sess["transcription_status"].update(state="complete", completed=1)
+        sess["transcription_status"].update(
+            state="complete", stage="complete", completed=1,
+        )
     return jsonify(transcript=transcript, segments=all_segments)
 
 
@@ -3056,6 +3104,27 @@ function updateTranscriptionProgress(status){
   const activeFileIndex = Number.isInteger(status.current_file_index)
     ? status.current_file_index : completed;
   if (status.state === 'running') {
+    if (status.stage === 'diarizing') {
+      const percent = Number(status.diarization_progress);
+    const hasPercent = status.diarization_progress !== null
+      && status.diarization_progress !== undefined
+      && Number.isFinite(percent);
+      const file = status.current_file ? `${status.current_file}: ` : '';
+      const step = status.diarization_step ? ` | ${status.diarization_step}` : '';
+      label.textContent = total > 1
+        ? `File ${Math.min(activeFileIndex + 1, total)} of ${total} | ${file}Diarizing speakers${step}${hasPercent ? `: ${percent}%` : '…'}`
+        : `${file}Diarizing speakers${step}${hasPercent ? `: ${percent}%` : '…'}`;
+      if (hasPercent) {
+        bar.classList.remove('indeterminate');
+        bar.style.width = `${percent}%`;
+        track.setAttribute('aria-valuenow', String(percent));
+      } else {
+        bar.classList.add('indeterminate');
+        bar.style.width = '';
+        track.removeAttribute('aria-valuenow');
+      }
+      return;
+    }
     const hasPercent = status.file_progress !== null
       && status.file_progress !== undefined
       && Number.isFinite(Number(status.file_progress));
