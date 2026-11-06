@@ -101,6 +101,7 @@ python -m venv .venv-cpp
 python -m pip install --upgrade pip
 reqfile="projects/diarix.cpp/requirements.txt"
 nreq=$(cat $reqfile|wc -l)
+uname -s | grep -q Darwin || pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
 nf=1
 for n in $(seq $nf $nreq); do
     cat $reqfile | head -n $n >/tmp/tmp
