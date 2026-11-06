@@ -1,1 +1,1 @@
-laucpp.sh
+lauboth.sh
