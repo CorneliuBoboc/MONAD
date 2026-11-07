@@ -8,8 +8,8 @@ cd "$ROOT_DIR"
 APPS="morphix"
 ARG="${1:---warm}"
 OS="$(uname)"
-# Port 5030 belongs to diarix.cpp; leave it out of this launcher's cleanup.
-PORTS="5030 5034"
+# Only Morphix is launched here; diarix.cpp owns port 5030.
+PORTS="5034"
 VER="3.12"
 
 DEMO=false

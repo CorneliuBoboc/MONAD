@@ -12,4 +12,4 @@ cd ./projects/$APP
 
 python$VER app.py & pid=$!
 sleep 8
-test -d /proc/$pid
+kill -0 "$pid"
