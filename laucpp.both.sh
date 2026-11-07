@@ -8,8 +8,8 @@ WHISPER_CPP_BRANCH="Danielzapirtan"
 WHISPER_CPP_DIR="${WHISPER_CPP_DIR:-$HOME/code/Danielzapirtan/whisper.cpp}"
 WHISPER_CPP_MODEL_DIR="${WHISPER_CPP_MODEL_DIR:-$HOME/models}"
 WHISPER_CPP_BIN="${WHISPER_CPP_BIN:-$WHISPER_CPP_DIR/build/bin/whisper-cli}"
-VENV_DIR="$ROOT_DIR/.venv-cpp"
-PORT=5029
+VENV_DIR="$ROOT_DIR/.venv"
+PORT=5030
 MODE="${1:---warm}"
 
 cd "$ROOT_DIR"
