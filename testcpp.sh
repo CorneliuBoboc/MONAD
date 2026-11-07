@@ -4,12 +4,12 @@ set -e
 
 ROOT_DIR=$PWD
 APP_DIR="$ROOT_DIR/projects/diarix.cpp"
-PYTHON="$ROOT_DIR/.venv-cpp/bin/python"
+PYTHON="$ROOT_DIR/.venv/bin/python"
 WHISPER_CPP_DIR="${WHISPER_CPP_DIR:-$HOME/code/Danielzapirtan/whisper.cpp}"
 WHISPER_CPP_MODEL_DIR="${WHISPER_CPP_MODEL_DIR:-$HOME/models}"
 WHISPER_CPP_BIN="${WHISPER_CPP_BIN:-$WHISPER_CPP_DIR/build/bin/whisper-cli}"
 MODEL_PATH="$WHISPER_CPP_MODEL_DIR/ggml-large-v3.bin"
-PORT=5029
+PORT=5030
 URL="http://127.0.0.1:$PORT/"
 LOG_FILE="${TMPDIR:-/tmp}/diarix-cpp.log"
 
