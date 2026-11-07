@@ -72,7 +72,7 @@ direct_pip() {
 launch_apps() {
   SCRIPT="test.old.sh"
   pip install -r projects/morphix/requirements.txt
-  $SCRIPT $APPS
+  bash $SCRIPT $APPS
 }
 
 warm=true
