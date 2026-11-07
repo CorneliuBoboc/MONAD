@@ -20,4 +20,4 @@ case "$MODE" in
 esac
 
 bash "$ROOT_DIR/lau.old.both.sh" "$MODE"
-bash "$ROOT_DIR/laucpp.both.sh" "$MODE"
+bash "$ROOT_DIR/laucpp.both.sh" --warm
