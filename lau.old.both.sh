@@ -8,17 +8,13 @@ cd "$ROOT_DIR"
 APPS="morphix"
 ARG="${1:---warm}"
 OS="$(uname)"
-# Port 5029 belongs to diarix.cpp; leave it out of this launcher's cleanup.
+# Port 5030 belongs to diarix.cpp; leave it out of this launcher's cleanup.
 PORTS="5030 5034"
 VER="3.12"
 
 DEMO=false
 echo "$OS"|grep -q "^Linux$" && DEMO=true
 $DEMO && VER="3.14"
-#$DEMO && APPS=diarix
-ENGINE=mlx
-$DEMO && ENGINE=faster
-echo $ENGINE|grep -q "^mlx$" && VER="3.12"
 $DEMO || DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/opt/ffmpeg@7/lib
 
 test -n "$APPS"
