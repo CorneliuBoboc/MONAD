@@ -1,0 +1,5 @@
+requests
+flask
+yt-dlp
+pyannote-audio
+torch

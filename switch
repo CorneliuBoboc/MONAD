@@ -1,0 +1,13 @@
+#! /usr/bin/env bash
+
+set -e
+
+ARG=$1
+
+test -n $ARG
+
+if echo $ARG|grep -q "^mlx$"; then
+  ln -sf lau.old.sh lau.sh
+else
+  ln -sf laucpp.sh lau.sh
+fi
