@@ -68,6 +68,14 @@ class PdfSplitBoundaryTests(unittest.TestCase):
         self.assertEqual(chapters[1]["start_unit"], 2)
 
 
+class SplitPromptTests(unittest.TestCase):
+    def test_pdf_split_rules_are_not_repeated_in_system_prompt(self):
+        prompt = morphix.build_split_prompt("outline", "page", 2, "pdf")
+
+        self.assertNotIn("CRITICAL: Do NOT group all front matter", morphix.SPLIT_SYSTEM_PROMPT)
+        self.assertEqual(prompt.count("CRITICAL: Do NOT group all front matter"), 1)
+
+
 class PdfSplitEndpointTests(unittest.TestCase):
     def test_ai_split_keeps_preceding_page_chapter_title_with_chapter(self):
         pdf = fitz.open()
