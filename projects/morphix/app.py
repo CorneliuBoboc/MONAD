@@ -115,6 +115,13 @@ ENV_KEYS = {
     "gemini": "GEMINI_API_KEY",
 }
 
+# How long an async AI job is kept in memory before being reaped.
+JOB_TTL_SECONDS = 30 * 60
+
+# How many characters of outline to send to the model. Larger = better
+# accuracy on long books; smaller = faster. ~40k chars ≈ 10k tokens.
+OUTLINE_MAX_CHARS = 40000
+
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
 app.secret_key = os.environ.get("DOCUTIL_SECRET_KEY") or os.urandom(32)
@@ -124,8 +131,20 @@ _ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 # ---------------------------------------------------------------------------
 # Session / storage helpers
+#
+# Background worker threads have no Flask request context, so `session` and
+# therefore `get_sid()` would raise "Working outside of request context".
+# We allow the worker to bind a thread-local sid before it starts so that
+# every helper which eventually calls session_dir() works unchanged.
 # ---------------------------------------------------------------------------
+_ctx = threading.local()
+
+
 def get_sid():
+    # Background threads set _ctx.sid instead of using Flask's session.
+    override = getattr(_ctx, "sid", None)
+    if override:
+        return override
     sid = session.get("sid")
     if not sid:
         sid = uuid.uuid4().hex
@@ -327,12 +346,176 @@ def cleanup_loop():
                             shutil.rmtree(p, ignore_errors=True)
                     except Exception:
                         pass
+            # Reap finished AI jobs that have been idle past the TTL.
+            _reap_jobs(now)
         except Exception:
             pass
         time.sleep(900)
 
 
 threading.Thread(target=cleanup_loop, daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
+# Block cache
+#
+# extract_blocks() is the single hottest path in every operation (convert,
+# split, AI split, AI TOC). Parsing a 400-page PDF can take seconds. We cache
+# the result next to the source file so that repeated operations on the same
+# upload are near-instant. Cache files are session-scoped and removed by
+# cleanup_loop via shutil.rmtree on the whole session dir.
+# ---------------------------------------------------------------------------
+def _cache_path(rec):
+    return rec["abs_path"] + ".blocks.json"
+
+
+def get_blocks(rec):
+    """Return (blocks, prominence) for a file record, using the on-disk cache.
+
+    ``prominence`` is only populated for PDFs and maps a page index to the
+    normalized text of prominent (bold / larger) spans found on that page.
+    It powers align_pdf_section_starts() without reopening the PDF.
+    """
+    cache = _cache_path(rec)
+    if os.path.exists(cache):
+        try:
+            with open(cache, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data.get("blocks", []), data.get("prominence", {})
+        except Exception:
+            # Corrupt cache: fall through and rebuild.
+            pass
+
+    blocks, prominence = _extract_blocks_with_prominence(rec["abs_path"], rec["ext"])
+    try:
+        with open(cache, "w", encoding="utf-8") as f:
+            json.dump({"blocks": blocks, "prominence": prominence}, f)
+    except Exception:
+        # Cache write failure is not fatal; we just reparse next time.
+        pass
+    return blocks, prominence
+
+
+def _extract_blocks_with_prominence(path, ext):
+    """extract_blocks() wrapper that also returns PDF prominence data."""
+    if ext == "pdf" and fitz is not None:
+        return _extract_pdf_fitz_with_prominence(path)
+    return extract_blocks(path, ext), {}
+
+
+def _extract_pdf_fitz_with_prominence(path):
+    doc = fitz.open(path)
+    sizes = []
+    raw_blocks = []
+    prominence = {}
+    for pno in range(len(doc)):
+        page = doc[pno]
+        d = page.get_text("dict")
+        for block in d.get("blocks", []):
+            if block.get("type") != 0:
+                continue
+            parts = []
+            max_size = 0.0
+            bold = False
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    t = span.get("text", "")
+                    if t.strip():
+                        parts.append(t)
+                    max_size = max(max_size, span.get("size", 0) or 0)
+                    if "bold" in (span.get("font", "") or "").lower():
+                        bold = True
+            text = re.sub(r"\s+", " ", " ".join(parts)).strip()
+            if not text:
+                continue
+            sizes.append(max_size)
+            raw_blocks.append({"page": pno, "text": text, "size": max_size, "bold": bold})
+    doc.close()
+    if not sizes:
+        return [], {}
+
+    sizes_sorted = sorted(sizes)
+    body_size = sizes_sorted[len(sizes_sorted) // 2] or 1.0
+
+    blocks = []
+    for b in raw_blocks:
+        ratio = b["size"] / body_size
+        prominent = ratio >= 1.2 or b["bold"]
+        if prominent:
+            normalized = _normalized_boundary_text(b["text"])
+            if normalized:
+                prominence.setdefault(str(b["page"]), []).append(normalized)
+
+        if ratio >= 1.45:
+            level = 1
+        elif ratio >= 1.2:
+            level = 2
+        elif ratio >= 1.08 or (b["bold"] and len(b["text"]) < 90):
+            level = 3
+        else:
+            level = None
+        if level:
+            blocks.append({"type": "heading", "level": level, "text": b["text"], "page": b["page"]})
+        else:
+            blocks.append({"type": "para", "text": b["text"], "page": b["page"]})
+    return blocks, prominence
+
+
+# ---------------------------------------------------------------------------
+# Async AI job runner
+#
+# AI requests take tens of seconds. Rather than make the browser wait on a
+# single blocking fetch, /api/ai/split/start kicks off a worker thread and
+# returns a job_id; the frontend polls /api/jobs/<id> for progress. Job state
+# lives in memory, which is fine for a single-process dev app; behind a real
+# WSGI server with multiple workers you'd want a shared store (Redis etc.).
+# ---------------------------------------------------------------------------
+_jobs = {}
+_jobs_guard = threading.Lock()
+
+
+def _set_job(job_id, **fields):
+    with _jobs_guard:
+        job = _jobs.get(job_id)
+        if job is None:
+            return
+        job.update(fields)
+        job["updated"] = time.time()
+
+
+def _get_job(job_id):
+    with _jobs_guard:
+        job = _jobs.get(job_id)
+        return dict(job) if job else None
+
+
+def _reap_jobs(now):
+    with _jobs_guard:
+        dead = [jid for jid, j in _jobs.items()
+                if now - j.get("updated", now) > JOB_TTL_SECONDS]
+        for jid in dead:
+            _jobs.pop(jid, None)
+
+
+def _spawn_job(fn, *args):
+    sid = get_sid()  # captured in the request context, before thread creation
+    job_id = uuid.uuid4().hex
+    with _jobs_guard:
+        _jobs[job_id] = {
+            "status": "queued", "phase": "starting", "pct": 0,
+            "created": time.time(), "updated": time.time(), "sid": sid,
+        }
+
+    def runner():
+        _ctx.sid = sid  # bind the session for session_dir()/register_output()
+        try:
+            fn(job_id, *args)
+        except Exception as e:
+            traceback.print_exc()
+            _set_job(job_id, status="error", error=f"Smart split failed: {e}", pct=100)
+
+    threading.Thread(target=runner, daemon=True).start()
+    return job_id
 
 
 # ---------------------------------------------------------------------------
@@ -376,51 +559,7 @@ def extract_pdf(path):
 
 
 def _extract_pdf_fitz(path):
-    doc = fitz.open(path)
-    sizes = []
-    raw_blocks = []
-    for pno in range(len(doc)):
-        page = doc[pno]
-        d = page.get_text("dict")
-        for block in d.get("blocks", []):
-            if block.get("type") != 0:
-                continue
-            parts = []
-            max_size = 0.0
-            bold = False
-            for line in block.get("lines", []):
-                for span in line.get("spans", []):
-                    t = span.get("text", "")
-                    if t.strip():
-                        parts.append(t)
-                    max_size = max(max_size, span.get("size", 0) or 0)
-                    if "bold" in (span.get("font", "") or "").lower():
-                        bold = True
-            text = re.sub(r"\s+", " ", " ".join(parts)).strip()
-            if not text:
-                continue
-            sizes.append(max_size)
-            raw_blocks.append({"page": pno, "text": text, "size": max_size, "bold": bold})
-    doc.close()
-    if not sizes:
-        return []
-    sizes_sorted = sorted(sizes)
-    body_size = sizes_sorted[len(sizes_sorted) // 2] or 1.0
-    blocks = []
-    for b in raw_blocks:
-        ratio = b["size"] / body_size
-        if ratio >= 1.45:
-            level = 1
-        elif ratio >= 1.2:
-            level = 2
-        elif ratio >= 1.08 or (b["bold"] and len(b["text"]) < 90):
-            level = 3
-        else:
-            level = None
-        if level:
-            blocks.append({"type": "heading", "level": level, "text": b["text"], "page": b["page"]})
-        else:
-            blocks.append({"type": "para", "text": b["text"], "page": b["page"]})
+    blocks, _ = _extract_pdf_fitz_with_prominence(path)
     return blocks
 
 
@@ -937,38 +1076,6 @@ def call_ai(provider, key, model, system, prompt, max_tokens=4000):
     raise ValueError("Unknown AI provider.")
 
 
-def call_gemini_pdf_sections(api_key, filename, pdf_bytes, prompt):
-    if genai is None or types is None:
-        raise RuntimeError("google-genai is required for PDF chapter detection. Install it with: pip install google-genai")
-
-    client = genai.Client(api_key=api_key)
-    uploaded = client.files.upload(
-        file=io.BytesIO(pdf_bytes),
-        config=types.UploadFileConfig(mime_type="application/pdf", display_name=filename),
-    )
-    try:
-        resp = client.models.generate_content(
-            model=DEFAULT_MODELS["gemini"],
-            contents=[
-                types.Part.from_uri(file_uri=uploaded.uri, mime_type="application/pdf"),
-                SPLIT_SYSTEM_PROMPT,
-                prompt,
-            ],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.0,
-            ),
-        )
-        text = resp.text or ""
-        text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
-        return text
-    finally:
-        try:
-            client.files.delete(name=uploaded.name)
-        except Exception:
-            pass
-
-
 def truncate_text(s, n):
     if len(s) <= n:
         return s, False
@@ -1060,7 +1167,7 @@ def build_split_prompt(outline_text, unit_kind, total_units, ext=None):
             "- Front/back matter use number=null and filename prefixed with 00_ or 99_.\n"
             "- Filenames: ASCII letters/digits/underscore only, <=80 chars, no extension.\n"
             "- Do not invent content not present in the PDF.\n\n"
-            "Use this page-indexed outline with the attached PDF. The physical PDF page indices are authoritative "
+            "Use this page-indexed outline. The physical PDF page indices are authoritative "
             "even when printed page numbers differ.\n"
             f"OUTLINE:\n{outline_text}"
         )
@@ -1176,9 +1283,14 @@ def _normalized_boundary_text(text):
     return "".join(char.casefold() for char in text if char.isalnum())
 
 
-def align_pdf_section_starts(chapters, pdf_document):
-    """Move a split back when its title heading is on the prior physical page."""
-    if pdf_document is None:
+def align_pdf_section_starts(chapters, prominence):
+    """Move a split back when its title heading is on the prior physical page.
+
+    ``prominence`` is the cached mapping produced by the block extractor:
+    { "page_index": [normalized prominent text, ...] }. This avoids reopening
+    the PDF just to nudge boundaries.
+    """
+    if not prominence:
         return chapters
 
     aligned = [dict(chapter) for chapter in chapters]
@@ -1189,40 +1301,11 @@ def align_pdf_section_starts(chapters, pdf_document):
         if start <= int(aligned[index - 1]["start_unit"]) + 1 or len(title) < 12:
             continue
 
-        page = pdf_document[start - 1]
-        page_dict = page.get_text("dict")
-        span_sizes = [
-            span.get("size", 0)
-            for block in page_dict.get("blocks", [])
-            if block.get("type") == 0
-            for line in block.get("lines", [])
-            for span in line.get("spans", [])
-            if span.get("text", "").strip()
-        ]
-        if not span_sizes:
+        prev_texts = prominence.get(str(start - 1), [])
+        if not prev_texts:
             continue
-        median_size = sorted(span_sizes)[len(span_sizes) // 2]
-
-        for block in page_dict.get("blocks", []):
-            if block.get("type") != 0:
-                continue
-            spans = [
-                span
-                for line in block.get("lines", [])
-                for span in line.get("spans", [])
-                if span.get("text", "").strip()
-            ]
-            block_text = _normalized_boundary_text(
-                "".join(span.get("text", "") for span in spans)
-            )
-            if title not in block_text:
-                continue
-            prominent = any(
-                "bold" in span.get("font", "").casefold()
-                or span.get("size", 0) >= median_size * 1.2
-                for span in spans
-            )
-            if prominent:
+        for text in prev_texts:
+            if title in text:
                 chapter["start_unit"] = start - 1
                 break
     return aligned
@@ -1291,6 +1374,90 @@ def analyze_file(path, ext):
     except Exception as e:
         meta["analyze_error"] = str(e)
     return meta
+
+
+# ---------------------------------------------------------------------------
+# AI smart-split worker
+#
+# Extracted from api_ai_split so it can run in a background thread. It reports
+# progress via the job dict at each stage. It returns the list of finished
+# chapter dicts ({output_id, filename, title}) or raises.
+#
+# NOTE: the caller must have bound _ctx.sid on the current thread; the worker
+# relies on session_dir() working via that override.
+# ---------------------------------------------------------------------------
+def run_ai_split_job(job_id, rec, provider, key, model, target):
+    """Worker for /api/ai/split/start. Rec and key are already resolved."""
+    _set_job(job_id, status="running", phase="reading document", pct=5)
+
+    blocks, prominence = get_blocks(rec)
+    _set_job(job_id, phase="building outline", pct=15)
+
+    lines, total_units, unit_kind = build_outline_units(
+        blocks, rec["ext"], rec["meta"].get("units")
+    )
+    if total_units < 2:
+        raise RuntimeError("Document is too short to split into chapters.")
+
+    outline_text, truncated = truncate_outline_lines(lines, OUTLINE_MAX_CHARS)
+
+    prompt = build_split_prompt(outline_text, unit_kind, total_units, rec["ext"])
+    _set_job(job_id, phase=f"asking {provider}", pct=30)
+
+    # Both providers now get the text outline. This removes the multi-second
+    # (sometimes minute-long) Gemini file-upload + ingest round-trip and makes
+    # the two providers behave identically.
+    raw = call_ai(
+        provider, key, model or DEFAULT_MODELS[provider],
+        SPLIT_SYSTEM_PROMPT, prompt,
+    )
+
+    _set_job(job_id, phase="parsing boundaries", pct=65)
+    chapters = parse_split_response(
+        raw, total_units, require_pdf_page_indexes=(rec["ext"] == "pdf")
+    )
+    if rec["ext"] == "pdf":
+        chapters = align_pdf_section_starts(chapters, prominence)
+
+    ranges = chapters_to_ranges(chapters, total_units)
+    _set_job(job_id, phase="writing files", pct=80)
+
+    if rec["ext"] == "pdf":
+        # Reuse the already-cached blocks instead of re-extracting each part.
+        tmp_paths = []
+        for a, b in ranges:
+            sub = [blk for blk in blocks if a <= blk.get("page", -1) <= b]
+            p = os.path.join(session_dir(), f"tmp_{uuid.uuid4().hex}.{target}")
+            render_blocks(sub, target, p)
+            tmp_paths.append(p)
+    elif rec["ext"] == "epub":
+        tmp_paths = split_document(rec["abs_path"], rec["ext"], ranges, target_ext=target, out_dir=session_dir())
+    else:
+        tmp_paths = []
+        for a, b in ranges:
+            sub = blocks[a:b + 1]
+            p = os.path.join(session_dir(), f"tmp_{uuid.uuid4().hex}.{target}")
+            render_blocks(sub, target, p)
+            tmp_paths.append(p)
+
+    _set_job(job_id, phase="finalizing", pct=95)
+    results = []
+    for i, p in enumerate(tmp_paths):
+        oid = uuid.uuid4().hex
+        stored_name = f"{oid}.{target}"
+        final_path = os.path.join(session_dir(), stored_name)
+        shutil.move(p, final_path)
+        title = chapters[i]["title"] if i < len(chapters) else f"Part {i + 1}"
+        chapter_name = chapters[i].get("filename") if i < len(chapters) else None
+        if chapter_name:
+            fname = f"{chapter_name}.{target}"
+        else:
+            fname = f"{sanitize_title(title)}.{target}"
+        register_output(oid, fname, target, stored_name)
+        results.append({"output_id": oid, "filename": fname, "title": title})
+
+    _set_job(job_id, status="done", phase="complete", pct=100,
+             chapters=results, truncated_outline=truncated)
 
 
 # ---------------------------------------------------------------------------
@@ -1373,7 +1540,7 @@ def api_convert_batch():
                     raise ValueError("AZW3 files can only be converted to EPUB.")
                 convert_azw3_to_epub(rec["abs_path"], rec["filename"], out_path)
             else:
-                blocks = extract_blocks(rec["abs_path"], rec["ext"])
+                blocks, _ = get_blocks(rec)
                 render_blocks(blocks, target, out_path)
             fname = f"{safe_stem(rec['filename'])}.{target}"
             register_output(out_id, fname, target, stored_name)
@@ -1382,6 +1549,7 @@ def api_convert_batch():
             errors.append({"file_id": file_id, "filename": rec["filename"], "error": str(e)})
 
     return jsonify({"outputs": outputs, "errors": errors})
+
 
 @app.route("/api/upload", methods=["POST"])
 def api_upload():
@@ -1429,7 +1597,7 @@ def api_convert():
                 return jsonify(error="AZW3 files can only be converted to EPUB."), 400
             convert_azw3_to_epub(rec["abs_path"], rec["filename"], out_path)
         else:
-            blocks = extract_blocks(rec["abs_path"], rec["ext"])
+            blocks, _ = get_blocks(rec)
             render_blocks(blocks, target, out_path)
     except ValueError as e:
         return jsonify(error=str(e)), 400
@@ -1465,7 +1633,7 @@ def api_split():
             ranges = parse_ranges(spec, total)
             tmp_paths = split_document(rec["abs_path"], rec["ext"], ranges, target_ext=target, out_dir=session_dir())
         else:
-            blocks = extract_blocks(rec["abs_path"], rec["ext"])
+            blocks, _ = get_blocks(rec)
             units = group_blocks_into_sections(blocks)
             if len(units) < 2:
                 return jsonify(error="No top-level headings found to split by. Try 'Split smart by chapters (AI)' instead."), 400
@@ -1495,6 +1663,52 @@ def api_split():
     return jsonify({"parts": results})
 
 
+@app.route("/api/ai/split/start", methods=["POST"])
+def api_ai_split_start():
+    """Kick off an async AI split. Returns {job_id} immediately."""
+    data = request.get_json(force=True, silent=True) or {}
+    file_id = data.get("file_id", "")
+    provider = data.get("provider", "")
+    api_key = data.get("api_key") or None
+    model = (data.get("model") or "").strip() or None
+    target = (data.get("target_format") or "").lower()
+
+    if not valid_id(file_id):
+        return jsonify(error="Invalid file reference."), 400
+    if provider not in ("claude", "gemini"):
+        return jsonify(error="Unknown AI provider."), 400
+    rec = get_file_record(file_id)
+    if not rec:
+        return jsonify(error="File not found or session expired. Please re-upload."), 404
+    if rec["ext"] == "azw3":
+        return jsonify(error="AZW3 files must be converted to EPUB before AI operations."), 400
+    if target and target not in TARGET_FORMATS:
+        return jsonify(error="Unsupported target format."), 400
+    target = target or rec["ext"]
+
+    key = resolve_api_key(provider, api_key)
+    if not key:
+        return jsonify(error=(
+            f"No API key available for {provider}. Enter your own key, or set the "
+            f"{ENV_KEYS[provider]} environment variable on the server."
+        )), 400
+
+    job_id = _spawn_job(run_ai_split_job, rec, provider, key, model, target)
+    return jsonify({"job_id": job_id})
+
+
+@app.route("/api/jobs/<job_id>", methods=["GET"])
+def api_job_status(job_id):
+    if not valid_id(job_id):
+        return jsonify(error="Invalid job id."), 400
+    job = _get_job(job_id)
+    if job is None:
+        return jsonify(error="Job not found or expired."), 404
+    return jsonify(job)
+
+
+# Backwards-compatible synchronous endpoint. Internally it does the same work
+# as the async path but blocks. Prefer /api/ai/split/start from the UI.
 @app.route("/api/ai/split", methods=["POST"])
 def api_ai_split():
     data = request.get_json(force=True, silent=True) or {}
@@ -1524,71 +1738,39 @@ def api_ai_split():
             f"{ENV_KEYS[provider]} environment variable on the server."
         )), 400
 
+    # Run synchronously using a temp job so we reuse one code path.
+    job_id = uuid.uuid4().hex
+    sid = get_sid()
+    with _jobs_guard:
+        _jobs[job_id] = {
+            "status": "running", "phase": "starting", "pct": 0,
+            "created": time.time(), "updated": time.time(), "sid": sid,
+        }
+    _ctx.sid = sid
     try:
-        if rec["ext"] == "pdf" and provider == "gemini":
-            blocks = extract_blocks(rec["abs_path"], rec["ext"])
-            lines, total_units, unit_kind = build_outline_units(
-                blocks, rec["ext"], rec["meta"].get("units")
-            )
-            if total_units < 2:
-                return jsonify(error="Document is too short to split into chapters."), 400
-            outline_text, truncated = truncate_outline_lines(lines, 15000)
-            prompt = build_split_prompt(outline_text, unit_kind, total_units, rec["ext"])
-            with open(rec["abs_path"], "rb") as fh:
-                pdf_bytes = fh.read()
-            raw = call_gemini_pdf_sections(key, rec["filename"], pdf_bytes, prompt)
-        else:
-            blocks = extract_blocks(rec["abs_path"], rec["ext"])
-            lines, total_units, unit_kind = build_outline_units(
-                blocks, rec["ext"], rec["meta"].get("units")
-            )
-            if total_units < 2:
-                return jsonify(error="Document is too short to split into chapters."), 400
-            if rec["ext"] == "pdf":
-                outline_text, truncated = truncate_outline_lines(lines, 15000)
-            else:
-                outline_text, truncated = truncate_text("\n".join(lines), 15000)
-            prompt = build_split_prompt(outline_text, unit_kind, total_units, rec["ext"])
-            raw = call_ai(provider, key, model or DEFAULT_MODELS[provider], SPLIT_SYSTEM_PROMPT, prompt)
-        chapters = parse_split_response(
-            raw, total_units, require_pdf_page_indexes=(rec["ext"] == "pdf")
-        )
-        if rec["ext"] == "pdf" and fitz is not None:
-            with fitz.open(rec["abs_path"]) as pdf_document:
-                chapters = align_pdf_section_starts(chapters, pdf_document)
-        ranges = chapters_to_ranges(chapters, total_units)
-        if rec["ext"] in ("pdf", "epub"):
-            tmp_paths = split_document(rec["abs_path"], rec["ext"], ranges, target_ext=target, out_dir=session_dir())
-        else:
-            tmp_paths = []
-            for a, b in ranges:
-                sub = blocks[a:b + 1]
-                p = os.path.join(session_dir(), f"tmp_{uuid.uuid4().hex}.{target}")
-                render_blocks(sub, target, p)
-                tmp_paths.append(p)
+        run_ai_split_job(job_id, rec, provider, key, model, target)
     except RuntimeError as e:
+        with _jobs_guard:
+            _jobs.pop(job_id, None)
         return jsonify(error=str(e)), 502
     except ValueError as e:
+        with _jobs_guard:
+            _jobs.pop(job_id, None)
         return jsonify(error=str(e)), 400
     except Exception as e:
         traceback.print_exc()
+        with _jobs_guard:
+            _jobs.pop(job_id, None)
         return jsonify(error=f"Smart split failed: {e}"), 500
+    finally:
+        _ctx.sid = None
 
-    results = []
-    for i, p in enumerate(tmp_paths):
-        oid = uuid.uuid4().hex
-        stored_name = f"{oid}.{target}"
-        final_path = os.path.join(session_dir(), stored_name)
-        shutil.move(p, final_path)
-        title = chapters[i]["title"] if i < len(chapters) else f"Part {i + 1}"
-        chapter_name = chapters[i].get("filename") if i < len(chapters) else None
-        if chapter_name:
-            fname = f"{chapter_name}.{target}"
-        else:
-            fname = f"{sanitize_title(title)}.{target}"
-        register_output(oid, fname, target, stored_name)
-        results.append({"output_id": oid, "filename": fname, "title": title})
-    return jsonify({"chapters": results, "truncated_outline": truncated})
+    with _jobs_guard:
+        job = _jobs.pop(job_id, {})
+    return jsonify({
+        "chapters": job.get("chapters", []),
+        "truncated_outline": job.get("truncated_outline", False),
+    })
 
 
 @app.route("/api/ai/toc", methods=["POST"])
@@ -1618,7 +1800,7 @@ def api_ai_toc():
         )), 400
 
     try:
-        blocks = extract_blocks(rec["abs_path"], rec["ext"])
+        blocks, _ = get_blocks(rec)
         content_text, truncated = build_full_text(blocks, 100000)
         prompt = TOC_PROMPT_TEMPLATE.format(depth=depth, content=content_text)
         raw = call_ai(provider, key, model or DEFAULT_MODELS[provider], TOC_SYSTEM_PROMPT, prompt, max_tokens=4000)
@@ -1685,7 +1867,7 @@ def api_download_all():
 
 @app.errorhandler(413)
 def too_large(e):
-    return jsonify(error="File is too large (60 MB limit)."), 413
+    return jsonify(error="File is too large (150 MB limit)."), 413
 
 
 @app.errorhandler(500)
@@ -1784,6 +1966,11 @@ PAGE_HTML = r"""<!DOCTYPE html>
   .status.err{color:var(--danger);background:var(--danger-bg);padding:8px 12px;border-radius:7px}
   .status.ok{color:#1E5C34}
   .status.busy{color:var(--ink-soft)}
+  .status .phase{font-family:var(--mono);font-size:.76rem;letter-spacing:.03em;
+       text-transform:uppercase;color:var(--ink-soft);margin-left:8px}
+  .progress{height:4px;background:var(--line);border-radius:2px;overflow:hidden;margin-top:8px}
+  .progress .bar{height:100%;background:var(--accent);width:0%;
+       transition:width .3s ease}
   textarea{min-height:220px;font-family:var(--mono);font-size:.84rem;line-height:1.5;resize:vertical}
   .results-grid{display:flex;flex-direction:column;gap:10px;margin-top:14px}
   .ticket{display:flex;justify-content:space-between;align-items:center;background:#fff;
@@ -1824,7 +2011,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
     <!-- TAB 1: DOCUMENT -->
     <section class="tab-panel active" id="tab-document">
       <h3 class="panel-title">Upload document(s)</h3>
-      <p class="hint">Supports PDF, DOCX, AZW3, EPUB, Markdown, HTML and TXT &mdash; up to 60&nbsp;MB per upload. Add files from several folders; the pool stays open until you choose an operation.</p>
+      <p class="hint">Supports PDF, DOCX, AZW3, EPUB, Markdown, HTML and TXT &mdash; up to 150&nbsp;MB per upload. Add files from several folders; the pool stays open until you choose an operation.</p>
       <div class="dropzone" id="dropzone" tabindex="0" role="button" aria-label="Upload files">
         <div class="big">Drop files here, or click to choose one or more</div>
         <div class="small">.pdf &nbsp;.docx &nbsp;.azw3 &nbsp;.epub &nbsp;.md &nbsp;.html &nbsp;.txt</div>
@@ -1922,6 +2109,9 @@ PAGE_HTML = r"""<!DOCTYPE html>
         <div id="apiBoxSplit"></div>
         <div class="actions"><button class="btn accent" id="runAiSplitBtn" type="button">Analyze &amp; split</button></div>
         <div class="status" id="aiSplitStatus"></div>
+        <div class="progress" id="aiSplitProgressWrap" style="display:none">
+          <div class="bar" id="aiSplitProgressBar"></div>
+        </div>
       </div>
 
       <div class="ctrl-block" id="ctrl-ai-toc">
@@ -1991,7 +2181,6 @@ PAGE_HTML = r"""<!DOCTYPE html>
   "use strict";
   document.getElementById('year').textContent = new Date().getFullYear();
 
-  // state.files is now an array (previously a single object).
   var state = { files: [], op: null, outputs: [] };
 
   function $(sel, root){ return (root||document).querySelector(sel); }
@@ -2015,8 +2204,19 @@ PAGE_HTML = r"""<!DOCTYPE html>
   }
 
   // ---- Status helpers --------------------------------------------------
-  function setStatus(el, msg, kind){
-    el.textContent = msg || '';
+  function setStatus(el, msg, kind, phase){
+    el.innerHTML = '';
+    if (msg) {
+      var span = document.createElement('span');
+      span.textContent = msg;
+      el.appendChild(span);
+    }
+    if (phase) {
+      var ph = document.createElement('span');
+      ph.className = 'phase';
+      ph.textContent = phase;
+      el.appendChild(ph);
+    }
     el.className = 'status' + (kind ? ' ' + kind : '');
   }
 
@@ -2068,8 +2268,6 @@ PAGE_HTML = r"""<!DOCTYPE html>
           setStatus(statusEl, 'No usable files uploaded.', 'err');
           return;
         }
-        // Each picker/drop operation is an addition to the session's pool.
-        // Keep the dropzone open so files can be gathered from other folders.
         state.files = state.files.concat(uploaded);
         $('#fileCard').style.display = state.files.length ? 'flex' : 'none';
         renderFileCard();
@@ -2125,8 +2323,6 @@ PAGE_HTML = r"""<!DOCTYPE html>
     });
   });
 
-  // Split / AI ops only make sense for a single file. Grey them out when
-  // more than one file is loaded.
   function refreshOpAvailability(){
     var multi = state.files.length > 1;
     var hasAzw3 = state.files.some(function(f){ return f.ext === 'azw3'; });
@@ -2366,13 +2562,66 @@ PAGE_HTML = r"""<!DOCTYPE html>
       }).catch(function(e){ btn.disabled=false; setStatus(statusEl, ''+e, 'err'); });
   });
 
+  // ---- AI split (async, with polling) -----------------------------------
+  var aiSplitPollTimer = null;
+
+  function showAiSplitProgress(show){
+    $('#aiSplitProgressWrap').style.display = show ? 'block' : 'none';
+    if (!show) $('#aiSplitProgressBar').style.width = '0%';
+  }
+
+  function pollAiSplit(jobId, statusEl, btn){
+    fetch('/api/jobs/' + jobId)
+      .then(function(r){ return r.json().then(function(j){ return {ok:r.ok, body:j}; }); })
+      .then(function(res){
+        if (!res.ok) {
+          btn.disabled = false;
+          showAiSplitProgress(false);
+          setStatus(statusEl, res.body.error || 'Job not found.', 'err');
+          return;
+        }
+        var job = res.body;
+        if (job.status === 'error') {
+          btn.disabled = false;
+          showAiSplitProgress(false);
+          setStatus(statusEl, job.error || 'Smart split failed.', 'err');
+          return;
+        }
+        if (job.status === 'done') {
+          btn.disabled = false;
+          showAiSplitProgress(false);
+          var chapters = job.chapters || [];
+          setStatus(statusEl, chapters.length + ' chapter(s) created.' +
+            (job.truncated_outline ? ' (outline sampled for a very long document)' : ''),
+            'ok');
+          if (chapters.length) {
+            addResults(chapters);
+            activateTab('results');
+          }
+          return;
+        }
+        // still running
+        var pct = Math.max(0, Math.min(100, job.pct || 0));
+        $('#aiSplitProgressBar').style.width = pct + '%';
+        setStatus(statusEl, 'Working\u2026', 'busy', (job.phase || 'running') + ' \u00b7 ' + pct + '%');
+        aiSplitPollTimer = setTimeout(function(){ pollAiSplit(jobId, statusEl, btn); }, 1200);
+      })
+      .catch(function(e){
+        btn.disabled = false;
+        showAiSplitProgress(false);
+        setStatus(statusEl, 'Polling failed: ' + e, 'err');
+      });
+  }
+
   $('#runAiSplitBtn').addEventListener('click', function(){
     var btn = this, statusEl = $('#aiSplitStatus');
     if (!state.files.length) { setStatus(statusEl, 'No file uploaded.', 'err'); return; }
+    if (aiSplitPollTimer) { clearTimeout(aiSplitPollTimer); aiSplitPollTimer = null; }
     var api = readApiBox(aiSplitBox);
     btn.disabled = true;
-    setStatus(statusEl, 'Asking ' + api.provider + ' to analyze structure\u2026', 'busy');
-    fetch('/api/ai/split', {
+    showAiSplitProgress(true);
+    setStatus(statusEl, 'Starting\u2026', 'busy', 'queued \u00b7 0%');
+    fetch('/api/ai/split/start', {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({
         file_id: state.files[0].file_id, provider: api.provider, api_key: api.api_key,
@@ -2380,13 +2629,18 @@ PAGE_HTML = r"""<!DOCTYPE html>
       })
     }).then(function(r){ return r.json().then(function(j){ return {ok:r.ok, body:j}; }); })
       .then(function(res){
+        if (!res.ok) {
+          btn.disabled = false;
+          showAiSplitProgress(false);
+          setStatus(statusEl, res.body.error || 'Could not start job.', 'err');
+          return;
+        }
+        pollAiSplit(res.body.job_id, statusEl, btn);
+      }).catch(function(e){
         btn.disabled = false;
-        if (!res.ok) { setStatus(statusEl, res.body.error, 'err'); return; }
-        setStatus(statusEl, res.body.chapters.length + ' chapter(s) created.' +
-          (res.body.truncated_outline ? ' (outline truncated for very long documents)' : ''), 'ok');
-        addResults(res.body.chapters);
-        activateTab('results');
-      }).catch(function(e){ btn.disabled=false; setStatus(statusEl, ''+e, 'err'); });
+        showAiSplitProgress(false);
+        setStatus(statusEl, 'Could not start job: ' + e, 'err');
+      });
   });
 
   $('#runAiTocBtn').addEventListener('click', function(){
