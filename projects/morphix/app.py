@@ -2159,8 +2159,8 @@ PAGE_HTML = r"""<!DOCTYPE html>
     <div class="row">
       <label class="inline"><input type="checkbox" class="use-api" checked disabled> Use AI API</label>
       <select class="provider">
-        <option value="claude">Claude (Anthropic)</option>
         <option value="gemini">Gemini (Google)</option>
+        <option value="claude">Claude (Anthropic)</option>
       </select>
     </div>
     <div class="row">
