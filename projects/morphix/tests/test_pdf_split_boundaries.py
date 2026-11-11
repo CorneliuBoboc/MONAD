@@ -32,7 +32,10 @@ class PdfSplitBoundaryTests(unittest.TestCase):
         previous_page.insert_text((60, 150), "Body text before the chapter transition.")
         previous_page.insert_text((60, 400), self.title, fontname="hebo", fontsize=14)
 
-        aligned = morphix.align_pdf_section_starts(self.chapters(), self.document)
+        prominence = {
+            "1": [morphix._normalized_boundary_text(self.title)],
+        }
+        aligned = morphix.align_pdf_section_starts(self.chapters(), prominence)
 
         self.assertEqual(aligned[1]["start_unit"], 1)
         self.assertEqual(
@@ -45,7 +48,7 @@ class PdfSplitBoundaryTests(unittest.TestCase):
         previous_page.insert_text((60, 150), "Body text.")
         previous_page.insert_text((60, 400), self.title, fontsize=10)
 
-        aligned = morphix.align_pdf_section_starts(self.chapters(), self.document)
+        aligned = morphix.align_pdf_section_starts(self.chapters(), {})
 
         self.assertEqual(aligned[1]["start_unit"], 2)
 
@@ -53,7 +56,10 @@ class PdfSplitBoundaryTests(unittest.TestCase):
         previous_page = self.document[1]
         previous_page.insert_text((60, 150), self.title, fontname="hebo", fontsize=14)
 
-        aligned = morphix.align_pdf_section_starts(self.chapters(), self.document)
+        prominence = {
+            "1": [morphix._normalized_boundary_text(self.title)],
+        }
+        aligned = morphix.align_pdf_section_starts(self.chapters(), prominence)
 
         self.assertEqual(aligned[1]["start_unit"], 1)
 
@@ -63,13 +69,115 @@ class PdfSplitBoundaryTests(unittest.TestCase):
         previous_page.insert_text((60, 740), self.title, fontname="hebo", fontsize=14)
         chapters = self.chapters()
 
-        morphix.align_pdf_section_starts(chapters, self.document)
+        prominence = {
+            "1": [morphix._normalized_boundary_text(self.title)],
+        }
+        morphix.align_pdf_section_starts(chapters, prominence)
 
         self.assertEqual(chapters[1]["start_unit"], 2)
 
 
+class SplitPromptTests(unittest.TestCase):
+    def test_pdf_split_rules_are_not_repeated_in_system_prompt(self):
+        prompt = morphix.build_split_prompt("outline", "page", 2, "pdf")
+
+        self.assertNotIn("CRITICAL: Do NOT group all front matter", morphix.SPLIT_SYSTEM_PROMPT)
+        self.assertEqual(prompt.count("CRITICAL: Do NOT group all front matter"), 1)
+
+    def test_outline_keeps_numbered_chapter_and_appendix_titles(self):
+        title = "3“I Didn’t Mean for It to Happen”"
+        blocks = [
+            {"page": 0, "type": "para", "text": "Contents"},
+            {"page": 1, "type": "heading", "text": "Earlier heading"},
+            {"page": 1, "type": "heading", "text": "Another heading"},
+            {"page": 1, "type": "heading", "text": title},
+            {"page": 1, "type": "heading", "text": "Appendix 3Extra Material"},
+        ]
+
+        lines, _, _ = morphix.build_outline_units(blocks, "pdf", 2)
+
+        self.assertIn(title, lines[1])
+        self.assertIn("Appendix 3Extra Material", lines[1])
+
+    def test_scanned_outline_keeps_all_caps_ocr_headings(self):
+        blocks = [
+            {"page": 0, "type": "para", "text": "Cover"},
+            {"page": 1, "type": "para", "text": "CAPITOLUL I", "ocr": True},
+            {"page": 1, "type": "para", "text": "ordinary body text", "ocr": True},
+        ]
+
+        lines, _, _ = morphix.build_outline_units(blocks, "pdf", 2)
+
+        self.assertIn("CAPITOLUL I", lines[1])
+
+    def test_ocr_heading_inventory_uses_physical_page_indexes(self):
+        blocks = [
+            {"page": 0, "text": "DIANETICA", "ocr": False},
+            {"page": 2, "text": "CAPITOLUL I", "ocr": True},
+            {"page": 3, "text": "IGNORED PAGE", "ocr": False},
+        ]
+
+        inventory = morphix._build_ocr_heading_outline(blocks)
+
+        self.assertIn("[0] DIANETICA", inventory)
+        self.assertIn("[2] CAPITOLUL I", inventory)
+        self.assertNotIn("IGNORED PAGE", inventory)
+
+
+class PdfOcrExtractionTests(unittest.TestCase):
+    class Page:
+        def __init__(self, data, image=True, ocr_data=None, ocr_error=None):
+            self.data = data
+            self.image = image
+            self.ocr_data = ocr_data
+            self.ocr_error = ocr_error
+            self.ocr_calls = 0
+
+        def get_text(self, kind, textpage=None):
+            return self.ocr_data if textpage else self.data
+
+        def get_images(self):
+            return [object()] if self.image else []
+
+        def get_textpage_ocr(self, **kwargs):
+            self.ocr_calls += 1
+            if self.ocr_error:
+                raise self.ocr_error
+            return object()
+
+    @staticmethod
+    def text_dict(text):
+        return {"blocks": [{
+            "type": 0,
+            "lines": [{"spans": [{"text": text}]}],
+        }]}
+
+    def test_ocr_is_used_only_for_sparse_image_pages(self):
+        scanned = self.Page(
+            {"blocks": []},
+            ocr_data=self.text_dict("Recognized chapter title"),
+        )
+        text, used_ocr = morphix._pdf_page_text_dict(scanned)
+        self.assertTrue(used_ocr)
+        self.assertEqual(scanned.ocr_calls, 1)
+        self.assertEqual(text, scanned.ocr_data)
+
+        searchable = self.Page(
+            self.text_dict("A searchable page with enough text to avoid OCR.")
+        )
+        _, used_ocr = morphix._pdf_page_text_dict(searchable)
+        self.assertFalse(used_ocr)
+        self.assertEqual(searchable.ocr_calls, 0)
+
+    def test_missing_ocr_engine_is_reported_for_scanned_pages(self):
+        page = self.Page({"blocks": []}, ocr_error=FileNotFoundError("tesseract"))
+
+        with self.assertRaisesRegex(RuntimeError, "Install Tesseract"):
+            morphix._pdf_page_text_dict(page)
+
+
 class PdfSplitEndpointTests(unittest.TestCase):
-    def test_ai_split_keeps_preceding_page_chapter_title_with_chapter(self):
+    def test_ai_split_preserves_source_pdf_when_ocr_was_used(self):
         pdf = fitz.open()
         for _ in range(4):
             pdf.new_page()
@@ -102,8 +210,12 @@ class PdfSplitEndpointTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=repo_root, prefix=".morphix-test-") as storage:
             with patch.object(morphix, "STORAGE_DIR", storage), patch.object(
                 morphix,
-                "call_gemini_pdf_sections",
+                "call_ai",
                 return_value=ai_response,
+            ), patch.object(
+                morphix,
+                "_pdf_page_text_dict",
+                side_effect=lambda page: (page.get_text("dict"), page.number == 1),
             ):
                 with morphix.app.test_client() as client:
                     upload = client.post(

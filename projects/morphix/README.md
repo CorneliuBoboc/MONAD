@@ -30,6 +30,10 @@ Two dependencies are optional-but-recommended:
   extracts plain text only (no heading detection, weaker paragraph
   boundaries). Install PyMuPDF for meaningfully better PDF conversion/split
   quality.
+- **Tesseract OCR** — scanned PDFs with little or no selectable text need the
+  Tesseract executable and English language data for smart splitting. OCR is
+  used only on image pages with sparse text; when smart split outputs PDF
+  files, it keeps the original pages and their layout.
 - **EbookLib** — required for any EPUB support (reading, writing, splitting).
   There is no fallback for EPUB.
 
