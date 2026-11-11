@@ -360,11 +360,13 @@ threading.Thread(target=cleanup_loop, daemon=True).start()
 # Block cache
 #
 # extract_blocks() is the single hottest path in every operation (convert,
-# split, AI split, AI TOC). Parsing a 400-page PDF can take seconds. We cache
-# the result next to the source file so that repeated operations on the same
-# upload are near-instant. Cache files are session-scoped and removed by
-# cleanup_loop via shutil.rmtree on the whole session dir.
+# split, AI split, AI TOC). Parsing a PDF can take time, especially when OCR is
+# needed. Cache the result next to the source so repeated operations are fast.
+# Cache files are session-scoped and removed by cleanup_loop.
 # ---------------------------------------------------------------------------
+BLOCK_CACHE_VERSION = 2
+
+
 def _cache_path(rec):
     return rec["abs_path"] + ".blocks.json"
 
@@ -381,7 +383,8 @@ def get_blocks(rec):
         try:
             with open(cache, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            return data.get("blocks", []), data.get("prominence", {})
+            if data.get("version") == BLOCK_CACHE_VERSION:
+                return data.get("blocks", []), data.get("prominence", {})
         except Exception:
             # Corrupt cache: fall through and rebuild.
             pass
@@ -389,7 +392,11 @@ def get_blocks(rec):
     blocks, prominence = _extract_blocks_with_prominence(rec["abs_path"], rec["ext"])
     try:
         with open(cache, "w", encoding="utf-8") as f:
-            json.dump({"blocks": blocks, "prominence": prominence}, f)
+            json.dump({
+                "version": BLOCK_CACHE_VERSION,
+                "blocks": blocks,
+                "prominence": prominence,
+            }, f)
     except Exception:
         # Cache write failure is not fatal; we just reparse next time.
         pass
@@ -408,29 +415,37 @@ def _extract_pdf_fitz_with_prominence(path):
     sizes = []
     raw_blocks = []
     prominence = {}
-    for pno in range(len(doc)):
-        page = doc[pno]
-        d = page.get_text("dict")
-        for block in d.get("blocks", []):
-            if block.get("type") != 0:
-                continue
-            parts = []
-            max_size = 0.0
-            bold = False
-            for line in block.get("lines", []):
-                for span in line.get("spans", []):
-                    t = span.get("text", "")
-                    if t.strip():
-                        parts.append(t)
-                    max_size = max(max_size, span.get("size", 0) or 0)
-                    if "bold" in (span.get("font", "") or "").lower():
-                        bold = True
-            text = re.sub(r"\s+", " ", " ".join(parts)).strip()
-            if not text:
-                continue
-            sizes.append(max_size)
-            raw_blocks.append({"page": pno, "text": text, "size": max_size, "bold": bold})
-    doc.close()
+    try:
+        for pno in range(len(doc)):
+            page = doc[pno]
+            d, used_ocr = _pdf_page_text_dict(page)
+            for block in d.get("blocks", []):
+                if block.get("type") != 0:
+                    continue
+                parts = []
+                max_size = 0.0
+                bold = False
+                for line in block.get("lines", []):
+                    for span in line.get("spans", []):
+                        t = span.get("text", "")
+                        if t.strip():
+                            parts.append(t)
+                        max_size = max(max_size, span.get("size", 0) or 0)
+                        if "bold" in (span.get("font", "") or "").lower():
+                            bold = True
+                text = re.sub(r"\s+", " ", " ".join(parts)).strip()
+                if not text:
+                    continue
+                sizes.append(max_size)
+                raw_blocks.append({
+                    "page": pno,
+                    "text": text,
+                    "size": max_size,
+                    "bold": bold,
+                    "ocr": used_ocr,
+                })
+    finally:
+        doc.close()
     if not sizes:
         return [], {}
 
@@ -455,10 +470,44 @@ def _extract_pdf_fitz_with_prominence(path):
         else:
             level = None
         if level:
-            blocks.append({"type": "heading", "level": level, "text": b["text"], "page": b["page"]})
+            blocks.append({
+                "type": "heading",
+                "level": level,
+                "text": b["text"],
+                "page": b["page"],
+                "ocr": b["ocr"],
+            })
         else:
-            blocks.append({"type": "para", "text": b["text"], "page": b["page"]})
+            blocks.append({
+                "type": "para",
+                "text": b["text"],
+                "page": b["page"],
+                "ocr": b["ocr"],
+            })
     return blocks, prominence
+
+
+def _pdf_page_text_dict(page):
+    """Extract page text, using OCR only for image pages with almost no text."""
+    data = page.get_text("dict")
+    text_length = sum(
+        len(span.get("text", ""))
+        for block in data.get("blocks", [])
+        if block.get("type") == 0
+        for line in block.get("lines", [])
+        for span in line.get("spans", [])
+    )
+    if text_length >= 40 or not page.get_images():
+        return data, False
+
+    try:
+        textpage = page.get_textpage_ocr(language="eng", dpi=90)
+    except Exception as exc:
+        raise RuntimeError(
+            "This scanned PDF needs OCR. Install Tesseract with English language data "
+            "to split it by chapters."
+        ) from exc
+    return page.get_text("dict", textpage=textpage), True
 
 
 # ---------------------------------------------------------------------------
@@ -1121,8 +1170,24 @@ def build_outline_units(blocks, ext, total_units=None):
         for i in range(total):
             pblocks = pages.get(i, [])
             heads = [x["text"] for x in pblocks if x["type"] == "heading"]
+            section_heads = [
+                text for text in heads
+                if re.match(r"^\s*\d{1,2}(?=[A-Z“])", text)
+                or re.match(r"^\s*Appendix\s+\d+(?:\b|(?=[A-Z]))", text, re.I)
+            ]
+            heads = list(dict.fromkeys(heads[:2] + section_heads))
             snippet = next((x["text"] for x in pblocks if x["type"] == "para"), "")
-            desc = "; ".join(heads[:2]) if heads else snippet[:100]
+            if any(block.get("ocr") for block in pblocks):
+                ocr_heads = [
+                    block["text"] for block in pblocks
+                    if _is_ocr_heading(block["text"])
+                ]
+                page_text = " ".join(block["text"] for block in pblocks)
+                desc = "; ".join(dict.fromkeys(heads + ocr_heads))
+                if not desc:
+                    desc = page_text[:180]
+            else:
+                desc = "; ".join(heads) if heads else snippet[:100]
             lines.append(f"[{i}] {desc}")
         return lines, total, "page"
     if ext == "epub":
@@ -1143,6 +1208,30 @@ def build_outline_units(blocks, ext, total_units=None):
         tag = f"H{b['level']}" if b["type"] == "heading" else "P"
         lines.append(f"[{i}] ({tag}) {b['text'][:100]}")
     return lines, len(blocks), "block"
+
+
+def _is_ocr_heading(text):
+    """Keep short all-caps OCR blocks visible in scanned-PDF outlines."""
+    letters = [char for char in text if char.isalpha()]
+    return (
+        4 <= len(text.strip()) <= 100
+        and len(letters) >= 4
+        and sum(char.isupper() for char in letters) / len(letters) >= 0.65
+    )
+
+
+def _build_ocr_heading_outline(blocks):
+    headings_by_page = {}
+    for block in blocks:
+        page = block.get("page")
+        if not block.get("ocr") and page != 0:
+            continue
+        if _is_ocr_heading(block["text"]):
+            headings_by_page.setdefault(page, []).append(block["text"].strip())
+    return "\n".join(
+        f"[{page}] {'; '.join(dict.fromkeys(headings))}"
+        for page, headings in sorted(headings_by_page.items())
+    )
 
 
 def build_split_prompt(outline_text, unit_kind, total_units, ext=None):
@@ -1399,7 +1488,18 @@ def run_ai_split_job(job_id, rec, provider, key, model, target):
     if total_units < 2:
         raise RuntimeError("Document is too short to split into chapters.")
 
-    outline_text, truncated = truncate_outline_lines(lines, OUTLINE_MAX_CHARS)
+    ocr_headings = (
+        _build_ocr_heading_outline(blocks)
+        if rec["ext"] == "pdf" and any(block.get("ocr") for block in blocks)
+        else ""
+    )
+    outline_budget = max(1000, OUTLINE_MAX_CHARS - len(ocr_headings) - 64)
+    outline_text, truncated = truncate_outline_lines(lines, outline_budget)
+    if ocr_headings:
+        outline_text = (
+            "OCR-RECOGNIZED UPPERCASE HEADING CANDIDATES:\n"
+            f"{ocr_headings}\n\nPAGE OUTLINE:\n{outline_text}"
+        )
 
     prompt = build_split_prompt(outline_text, unit_kind, total_units, rec["ext"])
     _set_job(job_id, phase=f"asking {provider}", pct=30)
@@ -1424,12 +1524,15 @@ def run_ai_split_job(job_id, rec, provider, key, model, target):
 
     if rec["ext"] == "pdf":
         # Reuse the already-cached blocks instead of re-extracting each part.
-        tmp_paths = []
-        for a, b in ranges:
-            sub = [blk for blk in blocks if a <= blk.get("page", -1) <= b]
-            p = os.path.join(session_dir(), f"tmp_{uuid.uuid4().hex}.{target}")
-            render_blocks(sub, target, p)
-            tmp_paths.append(p)
+        if target == "pdf" and any(block.get("ocr") for block in blocks):
+            tmp_paths = _split_pdf(rec["abs_path"], ranges, session_dir())
+        else:
+            tmp_paths = []
+            for a, b in ranges:
+                sub = [blk for blk in blocks if a <= blk.get("page", -1) <= b]
+                p = os.path.join(session_dir(), f"tmp_{uuid.uuid4().hex}.{target}")
+                render_blocks(sub, target, p)
+                tmp_paths.append(p)
     elif rec["ext"] == "epub":
         tmp_paths = split_document(rec["abs_path"], rec["ext"], ranges, target_ext=target, out_dir=session_dir())
     else:
