@@ -1073,7 +1073,7 @@ def resolve_api_key(provider, user_key):
     return os.environ.get(ENV_KEYS.get(provider, ""), "").strip() or None
 
 
-def call_claude(api_key, model, system, prompt, max_tokens=4000):
+def call_claude(api_key, model, system, prompt, max_tokens=4000, temperature=None):
     try:
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
@@ -1085,6 +1085,7 @@ def call_claude(api_key, model, system, prompt, max_tokens=4000):
             json={
                 "model": model, "max_tokens": max_tokens, "system": system,
                 "messages": [{"role": "user", "content": prompt}],
+                **({"temperature": temperature} if temperature is not None else {}),
             },
             timeout=120,
         )
@@ -1096,12 +1097,15 @@ def call_claude(api_key, model, system, prompt, max_tokens=4000):
     return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
 
 
-def call_gemini(api_key, model, system, prompt, max_tokens=4000):
+def call_gemini(api_key, model, system, prompt, max_tokens=4000, temperature=None):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     payload = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "systemInstruction": {"parts": [{"text": system}]},
-        "generationConfig": {"maxOutputTokens": max_tokens},
+        "generationConfig": {
+            "maxOutputTokens": max_tokens,
+            **({"temperature": temperature} if temperature is not None else {}),
+        },
     }
     try:
         resp = requests.post(url, json=payload, timeout=120)
@@ -1117,11 +1121,11 @@ def call_gemini(api_key, model, system, prompt, max_tokens=4000):
     return "".join(p.get("text", "") for p in parts)
 
 
-def call_ai(provider, key, model, system, prompt, max_tokens=4000):
+def call_ai(provider, key, model, system, prompt, max_tokens=4000, temperature=None):
     if provider == "claude":
-        return call_claude(key, model, system, prompt, max_tokens)
+        return call_claude(key, model, system, prompt, max_tokens, temperature)
     if provider == "gemini":
-        return call_gemini(key, model, system, prompt, max_tokens)
+        return call_gemini(key, model, system, prompt, max_tokens, temperature)
     raise ValueError("Unknown AI provider.")
 
 
@@ -1475,6 +1479,25 @@ def analyze_file(path, ext):
 # NOTE: the caller must have bound _ctx.sid on the current thread; the worker
 # relies on session_dir() working via that override.
 # ---------------------------------------------------------------------------
+def pdf_split_filename(chapter, first_page, last_page, total_pages, chapter_number, target):
+    kind = chapter.get("kind")
+    if kind == "frontmatter":
+        chapter_no = 0
+    elif kind == "backmatter":
+        chapter_no = 99
+    else:
+        chapter_number += 1
+        chapter_no = chapter_number
+
+    page_width = 4 if total_pages >= 1000 else 3
+    title = sanitize_title(chapter["title"])
+    filename = (
+        f"pages_{first_page + 1:0{page_width}d}_"
+        f"{last_page + 1:0{page_width}d}_{chapter_no:02d}_{title}.{target}"
+    )
+    return filename, chapter_number
+
+
 def run_ai_split_job(job_id, rec, provider, key, model, target):
     """Worker for /api/ai/split/start. Rec and key are already resolved."""
     _set_job(job_id, status="running", phase="reading document", pct=5)
@@ -1509,7 +1532,7 @@ def run_ai_split_job(job_id, rec, provider, key, model, target):
     # the two providers behave identically.
     raw = call_ai(
         provider, key, model or DEFAULT_MODELS[provider],
-        SPLIT_SYSTEM_PROMPT, prompt,
+        SPLIT_SYSTEM_PROMPT, prompt, temperature=0.1,
     )
 
     _set_job(job_id, phase="parsing boundaries", pct=65)
@@ -1545,6 +1568,7 @@ def run_ai_split_job(job_id, rec, provider, key, model, target):
 
     _set_job(job_id, phase="finalizing", pct=95)
     results = []
+    chapter_number = 0
     for i, p in enumerate(tmp_paths):
         oid = uuid.uuid4().hex
         stored_name = f"{oid}.{target}"
@@ -1552,7 +1576,14 @@ def run_ai_split_job(job_id, rec, provider, key, model, target):
         shutil.move(p, final_path)
         title = chapters[i]["title"] if i < len(chapters) else f"Part {i + 1}"
         chapter_name = chapters[i].get("filename") if i < len(chapters) else None
-        if chapter_name:
+        if rec["ext"] == "pdf":
+            chapter = chapters[i] if i < len(chapters) else {}
+            first_page, last_page = ranges[i]
+            fname, chapter_number = pdf_split_filename(
+                {**chapter, "title": title}, first_page, last_page, total_units,
+                chapter_number, target,
+            )
+        elif chapter_name:
             fname = f"{chapter_name}.{target}"
         else:
             fname = f"{sanitize_title(title)}.{target}"

@@ -78,6 +78,33 @@ class PdfSplitBoundaryTests(unittest.TestCase):
 
 
 class SplitPromptTests(unittest.TestCase):
+    def test_pdf_split_filenames_use_page_range_and_section_numbers(self):
+        chapters = [
+            {"title": "Preface", "kind": "frontmatter"},
+            {"title": "Opening", "kind": "chapter"},
+            {"title": "Appendix", "kind": "backmatter"},
+        ]
+        ranges = [(0, 8), (9, 99), (100, 998)]
+
+        names = []
+        chapter_number = 0
+        for chapter, (first, last) in zip(chapters, ranges):
+            name, chapter_number = morphix.pdf_split_filename(
+                chapter, first, last, 999, chapter_number, "pdf"
+            )
+            names.append(name)
+
+        self.assertEqual(names, [
+            "pages_001_009_00_Preface.pdf",
+            "pages_010_100_01_Opening.pdf",
+            "pages_101_999_99_Appendix.pdf",
+        ])
+
+        wide_name, _ = morphix.pdf_split_filename(
+            {"title": "End", "kind": "chapter"}, 0, 999, 1000, 0, "pdf"
+        )
+        self.assertEqual(wide_name, "pages_0001_1000_01_End.pdf")
+
     def test_pdf_split_rules_are_not_repeated_in_system_prompt(self):
         prompt = morphix.build_split_prompt("outline", "page", 2, "pdf")
 
