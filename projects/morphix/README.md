@@ -31,9 +31,11 @@ Two dependencies are optional-but-recommended:
   boundaries). Install PyMuPDF for meaningfully better PDF conversion/split
   quality.
 - **Tesseract OCR** — scanned PDFs with little or no selectable text need the
-  Tesseract executable and English language data for smart splitting. OCR is
-  used only on image pages with sparse text; when smart split outputs PDF
-  files, it keeps the original pages and their layout.
+  Tesseract executable and language data matching the configured OCR languages.
+  OCR is used only on image pages with sparse text; when smart split outputs
+  PDF files, it keeps the original pages and their layout.
+  Set `MORPHIX_OCR_LANGUAGE` to installed Tesseract languages joined with `+`
+  (for example, `ron+eng` for Romanian and English scans); the default is `eng`.
 - **EbookLib** — required for any EPUB support (reading, writing, splitting).
   There is no fallback for EPUB.
 
@@ -85,14 +87,14 @@ document converter. Concretely:
   headings to define section boundaries; if none exist, use "Split smart by
   chapters (AI)" instead.
 - Very large documents are shortened before being sent to an AI provider
-  (~15,000 characters for chapter-boundary analysis, ~100,000 characters for
+  (~40,000 characters for chapter-boundary analysis, ~100,000 characters for
   TOC generation) to stay within reasonable request sizes; the UI tells you
-  when this happened. PDF chapter outlines are sampled evenly across the
-  document so later chapters are represented too. PDF split boundaries use
-  zero-based physical page indices (not printed page numbers), and each
-  section runs up to the page before the next section starts. If a section's
-  prominent title is printed on the preceding page, that page is assigned to
-  the section so its opening heading is not left behind.
+  when this happened. Oversized PDF chapter outlines preserve the opening and
+  ending pages while sampling the middle, so the whole book is represented.
+  PDF split boundaries use zero-based physical page indices (not printed page
+  numbers), and each section runs up to the page before the next section starts.
+  If a section's prominent title is printed on the preceding page, that page is
+  assigned to the section so its opening heading is not left behind.
 - AZW3 conversion downloads KindleUnpack from its upstream GitHub repository
   on first use, runs it with `--epub_version=2`, and removes its per-conversion
   temporary files afterward. AZW3 files are not available for splitting or AI

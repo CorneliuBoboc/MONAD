@@ -110,6 +110,32 @@ DEFAULT_MODELS = {
     "claude": "claude-sonnet-5",
     "gemini": "gemini-3.5-flash-lite",
 }
+GEMINI_FALLBACK_MODEL = "gemini-2.5-flash"
+GEMINI_MAX_ATTEMPTS = 3
+GEMINI_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+PDF_SPLIT_RESPONSE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "sections": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "title": {"type": "STRING"},
+                    "kind": {
+                        "type": "STRING",
+                        "enum": ["frontmatter", "chapter", "backmatter"],
+                    },
+                    "start_page_index": {"type": "INTEGER"},
+                    "filename": {"type": "STRING"},
+                },
+                "required": ["title", "kind", "start_page_index"],
+            },
+        },
+    },
+    "required": ["sections"],
+}
+PDF_OCR_LANGUAGE = os.environ.get("MORPHIX_OCR_LANGUAGE", "eng").strip() or "eng"
 ENV_KEYS = {
     "claude": "ANTHROPIC_API_KEY",
     "gemini": "GEMINI_API_KEY",
@@ -501,10 +527,10 @@ def _pdf_page_text_dict(page):
         return data, False
 
     try:
-        textpage = page.get_textpage_ocr(language="eng", dpi=90)
+        textpage = page.get_textpage_ocr(language=PDF_OCR_LANGUAGE, dpi=90)
     except Exception as exc:
         raise RuntimeError(
-            "This scanned PDF needs OCR. Install Tesseract with English language data "
+            "This scanned PDF needs OCR. Install Tesseract with the configured language data "
             "to split it by chapters."
         ) from exc
     return page.get_text("dict", textpage=textpage), True
@@ -1097,35 +1123,126 @@ def call_claude(api_key, model, system, prompt, max_tokens=4000, temperature=Non
     return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
 
 
-def call_gemini(api_key, model, system, prompt, max_tokens=4000, temperature=None):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+def _post_gemini_with_retries(url, payload):
+    for attempt in range(GEMINI_MAX_ATTEMPTS):
+        try:
+            resp = requests.post(url, json=payload, timeout=120)
+        except requests.RequestException as e:
+            if attempt == GEMINI_MAX_ATTEMPTS - 1:
+                raise RuntimeError(f"Could not reach the Gemini API: {e}") from e
+            time.sleep(2 ** (attempt + 1))
+            continue
+
+        if (
+            resp.status_code not in GEMINI_RETRYABLE_STATUS_CODES
+            or attempt == GEMINI_MAX_ATTEMPTS - 1
+        ):
+            break
+        try:
+            retry_after = float(resp.headers.get("Retry-After", ""))
+        except (TypeError, ValueError):
+            retry_after = 0
+        time.sleep(min(retry_after, 30) if retry_after > 0 else 2 ** (attempt + 1))
+    return resp
+
+
+def call_gemini(
+    api_key, model, system, prompt, max_tokens=4000, temperature=None,
+    response_mime_type=None, response_schema=None,
+):
+    base_url = "https://generativelanguage.googleapis.com/v1beta/models"
     payload = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "systemInstruction": {"parts": [{"text": system}]},
         "generationConfig": {
             "maxOutputTokens": max_tokens,
             **({"temperature": temperature} if temperature is not None else {}),
+            **({"responseMimeType": response_mime_type} if response_mime_type else {}),
+            **({"responseSchema": response_schema} if response_schema else {}),
         },
     }
-    try:
-        resp = requests.post(url, json=payload, timeout=120)
-    except requests.RequestException as e:
-        raise RuntimeError(f"Could not reach the Gemini API: {e}")
-    if resp.status_code != 200:
-        raise RuntimeError(f"Gemini API error ({resp.status_code}): {resp.text[:300]}")
-    data = resp.json()
-    candidates = data.get("candidates") or []
-    if not candidates:
-        raise RuntimeError("Gemini API returned no candidates (the request may have been blocked by safety filters).")
-    parts = candidates[0].get("content", {}).get("parts", [])
-    return "".join(p.get("text", "") for p in parts)
+
+    def payload_for_model(request_payload, request_model):
+        if (
+            response_mime_type == "application/json"
+            and request_model.startswith("gemini-2.5")
+        ):
+            return {
+                **request_payload,
+                "generationConfig": {
+                    **request_payload["generationConfig"],
+                    "thinkingConfig": {"thinkingBudget": 1024},
+                },
+            }
+        return request_payload
+
+    for generation_attempt in range(2):
+        request_payload = payload
+        if generation_attempt:
+            request_payload = {
+                **payload,
+                "contents": [{
+                    "role": "user",
+                    "parts": [{
+                        "text": (
+                            prompt
+                            + "\n\nReturn one complete, syntactically valid JSON object. "
+                            "Do not stop until all sections and closing brackets are included."
+                        )
+                    }],
+                }],
+                "generationConfig": {
+                    **payload["generationConfig"],
+                    "maxOutputTokens": min(max_tokens * 2, 8192),
+                },
+            }
+        request_payload = payload_for_model(request_payload, model)
+
+        url = f"{base_url}/{model}:generateContent?key={api_key}"
+        resp = _post_gemini_with_retries(url, request_payload)
+        if resp.status_code == 503 and model == DEFAULT_MODELS["gemini"]:
+            fallback_url = f"{base_url}/{GEMINI_FALLBACK_MODEL}:generateContent?key={api_key}"
+            fallback_payload = payload_for_model(request_payload, GEMINI_FALLBACK_MODEL)
+            resp = _post_gemini_with_retries(fallback_url, fallback_payload)
+
+        if resp.status_code != 200:
+            raise RuntimeError(f"Gemini API error ({resp.status_code}): {resp.text[:300]}")
+        data = resp.json()
+        candidates = data.get("candidates") or []
+        if not candidates:
+            raise RuntimeError("Gemini API returned no candidates (the request may have been blocked by safety filters).")
+        candidate = candidates[0]
+        parts = candidate.get("content", {}).get("parts", [])
+        text = "".join(p.get("text", "") for p in parts)
+        finish_reason = candidate.get("finishReason", "unknown")
+        if response_mime_type == "application/json":
+            try:
+                json.loads(text)
+            except json.JSONDecodeError as exc:
+                if generation_attempt == 0:
+                    continue
+                raise RuntimeError(
+                    f"Gemini returned invalid JSON at line {exc.lineno}, column {exc.colno} "
+                    f"(finish reason: {finish_reason})."
+                ) from exc
+            if finish_reason not in ("STOP", "unknown"):
+                raise RuntimeError(
+                    f"Gemini stopped before completing its JSON response ({finish_reason})."
+                )
+        return text
 
 
-def call_ai(provider, key, model, system, prompt, max_tokens=4000, temperature=None):
+def call_ai(
+    provider, key, model, system, prompt, max_tokens=4000, temperature=None,
+    response_mime_type=None, response_schema=None,
+):
     if provider == "claude":
         return call_claude(key, model, system, prompt, max_tokens, temperature)
     if provider == "gemini":
-        return call_gemini(key, model, system, prompt, max_tokens, temperature)
+        return call_gemini(
+            key, model, system, prompt, max_tokens, temperature,
+            response_mime_type, response_schema,
+        )
     raise ValueError("Unknown AI provider.")
 
 
@@ -1136,7 +1253,7 @@ def truncate_text(s, n):
 
 
 def truncate_outline_lines(lines, max_chars):
-    """Keep a uniformly sampled outline spanning the entire document."""
+    """Keep the beginning and end, sampling the middle across the document."""
     text = "\n".join(lines)
     if len(text) <= max_chars:
         return text, False
@@ -1148,10 +1265,24 @@ def truncate_outline_lines(lines, max_chars):
 
     count = min(len(lines), max(2, int(len(lines) * budget / max(1, len(text)))))
     while count >= 2:
-        indexes = [
-            round(i * (len(lines) - 1) / (count - 1))
-            for i in range(count)
-        ]
+        edge_count = min(max(1, count // 10), len(lines) // 3)
+        middle_start = edge_count
+        middle_end = len(lines) - edge_count
+        middle_count = count - edge_count * 2
+        if middle_count <= 0:
+            middle_indexes = []
+        elif middle_count == 1:
+            middle_indexes = [(middle_start + middle_end - 1) // 2]
+        else:
+            middle_indexes = [
+                middle_start + round(i * (middle_end - middle_start - 1) / (middle_count - 1))
+                for i in range(middle_count)
+            ]
+        indexes = (
+            list(range(edge_count))
+            + middle_indexes
+            + list(range(len(lines) - edge_count, len(lines)))
+        )
         sampled = "\n".join(lines[i] for i in indexes)
         if len(sampled) <= budget:
             return marker + "\n" + sampled, True
@@ -1174,24 +1305,37 @@ def build_outline_units(blocks, ext, total_units=None):
         for i in range(total):
             pblocks = pages.get(i, [])
             heads = [x["text"] for x in pblocks if x["type"] == "heading"]
+            page_text = " ".join(block["text"] for block in pblocks)
             section_heads = [
                 text for text in heads
                 if re.match(r"^\s*\d{1,2}(?=[A-Z“])", text)
                 or re.match(r"^\s*Appendix\s+\d+(?:\b|(?=[A-Z]))", text, re.I)
             ]
             heads = list(dict.fromkeys(heads[:2] + section_heads))
-            snippet = next((x["text"] for x in pblocks if x["type"] == "para"), "")
-            if any(block.get("ocr") for block in pblocks):
+            first_block = next(
+                (block for block in pblocks if block["text"].strip()), None
+            )
+            first_text = first_block["text"] if first_block else ""
+            compact_first = re.sub(r"\s+", "", first_text).lower()
+            is_contents_page = (
+                len(compact_first) <= 20
+                and re.search(r"(?:contents|cuprins)", compact_first)
+            )
+            if is_contents_page:
+                contents_blocks = [
+                    block["text"].strip() for block in pblocks if block["text"].strip()
+                ]
+                desc = "; ".join(contents_blocks)
+            elif any(block.get("ocr") for block in pblocks):
                 ocr_heads = [
                     block["text"] for block in pblocks
                     if _is_ocr_heading(block["text"])
                 ]
-                page_text = " ".join(block["text"] for block in pblocks)
-                desc = "; ".join(dict.fromkeys(heads + ocr_heads))
+                desc = "; ".join(dict.fromkeys(ocr_heads[:4]))
                 if not desc:
                     desc = page_text[:180]
             else:
-                desc = "; ".join(heads) if heads else snippet[:100]
+                desc = "; ".join(heads)[:140]
             lines.append(f"[{i}] {desc}")
         return lines, total, "page"
     if ext == "epub":
@@ -1242,9 +1386,21 @@ def build_split_prompt(outline_text, unit_kind, total_units, ext=None):
     if ext == "pdf":
         return (
             f"The PDF has {total_units} physical pages indexed from 0. "
-            "Identify every top-level section that should become its own standalone PDF.\n\n"
+            "Split the book at chapter level so each chapter becomes its own standalone PDF.\n\n"
             "CRITICAL: Do NOT group all front matter into one section, and do NOT group all back matter into one. Each distinct front-matter or back-matter item must be its OWN section with its OWN filename. Examples of separate front-matter sections: cover, copyright page, dedication, table of contents, foreword, preface, acknowledgements. Examples of separate back-matter sections: appendix A, appendix B, glossary, bibliography, index, colophon, about the author.\n\n"
-            "For proper chapters, use the chapter NUMBER shown in the document (not a running index).\n\n"
+            "CHAPTER-LEVEL SPLITTING: Each numbered chapter must be its own section, even when "
+            "several chapters are grouped under a Part heading. Do NOT group all chapters in a "
+            "Part into one section. If a Part heading immediately precedes its first chapter, "
+            "include that Part page with that chapter rather than creating a separate Part file. "
+            "Do not split on subheadings, running headers, or entries that appear only in the "
+            "table of contents. For proper chapters, use the chapter NUMBER shown in the document "
+            "(not a running index).\n\n"
+            "Use headings in the page outline and chapter titles from the contents; do not infer "
+            "section boundaries from ordinary body paragraphs.\n\n"
+            "Group continuation pages of the same front/back-matter item together (for example, "
+            "Foreword Page 2 is still part of the Foreword). A blank page is never its own section; "
+            "keep it with an adjacent item. Use chapter titles and numbers from the table of contents "
+            "to identify chapters, but use the physical page where each chapter actually begins.\n\n"
             "BOUNDARY COORDINATES ARE ZERO-BASED PHYSICAL PDF PAGE INDICES, NOT PRINTED PAGE NUMBERS. "
             "Use the bracketed index in the outline; [0] means the first PDF page. Ignore Roman-numeral "
             "folios, printed page numbers, and page references in the contents. Copy the physical index "
@@ -1307,11 +1463,21 @@ def parse_split_response(raw, total_units, require_pdf_page_indexes=False):
     text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.S).strip()
     try:
         data = json.loads(text)
-    except Exception:
+    except json.JSONDecodeError as exc:
         m = re.search(r"\{.*\}", text, re.S)
         if not m:
-            raise RuntimeError("The AI response was not valid JSON.")
-        data = json.loads(m.group(0))
+            raise RuntimeError(
+                f"The AI response was not valid JSON at line {exc.lineno}, column {exc.colno}."
+            ) from exc
+        try:
+            data = json.loads(m.group(0))
+        except json.JSONDecodeError as nested:
+            fragment = m.group(0)
+            start = max(0, nested.pos - 40)
+            end = min(len(fragment), nested.pos + 40)
+            raise RuntimeError(
+                f"The AI response was malformed near {fragment[start:end]!r}."
+            ) from nested
     if not isinstance(data, dict):
         raise RuntimeError("The AI response did not contain a usable section list.")
 
@@ -1354,6 +1520,9 @@ def parse_split_response(raw, total_units, require_pdf_page_indexes=False):
         title = str(item.get("title") or item.get("name") or item.get("filename") or "").strip()[:120]
         filename = item.get("filename")
         entry = {"title": title or f"Part {len(cleaned) + 1}", "start_unit": start_value}
+        kind = str(item.get("kind") or "").strip().lower()
+        if kind in {"frontmatter", "chapter", "backmatter"}:
+            entry["kind"] = kind
         if filename is not None and str(filename).strip():
             entry["filename"] = sanitize_pdf_split_filename(str(filename), title or f"Part {len(cleaned) + 1}")
         if not has_page_index and "start_page" in item:
@@ -1402,6 +1571,62 @@ def align_pdf_section_starts(chapters, prominence):
                 chapter["start_unit"] = start - 1
                 break
     return aligned
+
+
+def normalize_pdf_split_sections(chapters):
+    normalized = []
+    for chapter in chapters:
+        title = str(chapter.get("title", "")).strip()
+        if _normalized_boundary_text(title) in {
+            "blankpage",
+            "thispageintentionallyleftblank",
+        }:
+            continue
+
+        continuation = re.match(
+            r"^(.*?)\s+(?:page\s+\d+|continued(?:\s+\d+)?)$", title, re.I
+        )
+        if (
+            continuation
+            and normalized
+            and _normalized_boundary_text(continuation.group(1))
+            == _normalized_boundary_text(normalized[-1].get("title", ""))
+        ):
+            continue
+        normalized.append(dict(chapter))
+
+    if not normalized:
+        return []
+    normalized[0]["start_unit"] = 0
+
+    index = 0
+    while index < len(normalized) - 1:
+        section = normalized[index]
+        following = normalized[index + 1]
+        current_start = int(section["start_unit"])
+        following_start = int(following["start_unit"])
+        next_is_numbered_chapter = bool(
+            re.match(
+                r"^\s*(?:(?:chapter)\s+)?\d{1,2}[.:)]?\s+",
+                following.get("title", ""),
+                re.I,
+            )
+        )
+        is_part_heading = bool(
+            re.match(r"^\s*(?:part|section)\s+", section.get("title", ""), re.I)
+        )
+        is_nearby_part_title = (
+            section.get("kind") == "chapter"
+            and following.get("kind") == "chapter"
+            and next_is_numbered_chapter
+            and 0 < following_start - current_start <= 2
+        )
+        if is_part_heading or is_nearby_part_title:
+            following["start_unit"] = current_start
+            normalized.pop(index)
+            continue
+        index += 1
+    return normalized
 
 
 def chapters_to_ranges(chapters, total_units):
@@ -1533,6 +1758,12 @@ def run_ai_split_job(job_id, rec, provider, key, model, target):
     raw = call_ai(
         provider, key, model or DEFAULT_MODELS[provider],
         SPLIT_SYSTEM_PROMPT, prompt, temperature=0.1,
+        response_mime_type="application/json" if provider == "gemini" else None,
+        response_schema=(
+            PDF_SPLIT_RESPONSE_SCHEMA
+            if provider == "gemini" and rec["ext"] == "pdf"
+            else None
+        ),
     )
 
     _set_job(job_id, phase="parsing boundaries", pct=65)
@@ -1541,13 +1772,13 @@ def run_ai_split_job(job_id, rec, provider, key, model, target):
     )
     if rec["ext"] == "pdf":
         chapters = align_pdf_section_starts(chapters, prominence)
+        chapters = normalize_pdf_split_sections(chapters)
 
     ranges = chapters_to_ranges(chapters, total_units)
     _set_job(job_id, phase="writing files", pct=80)
 
     if rec["ext"] == "pdf":
-        # Reuse the already-cached blocks instead of re-extracting each part.
-        if target == "pdf" and any(block.get("ocr") for block in blocks):
+        if target == "pdf":
             tmp_paths = _split_pdf(rec["abs_path"], ranges, session_dir())
         else:
             tmp_paths = []
