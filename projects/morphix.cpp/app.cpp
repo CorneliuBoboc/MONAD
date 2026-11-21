@@ -22,6 +22,7 @@
 #include <thread>
 #include <ctime>
 #include <unordered_map>
+#include <set>
 #include <vector>
 #include <unistd.h>
 
@@ -657,7 +658,8 @@ static std::string call_claude(const std::string& key, const std::string& model,
 }
 
 static std::string call_gemini(const std::string& key, const std::string& model,
-                               const std::string& system, const std::string& prompt) {
+                               const std::string& system, const std::string& prompt,
+                               bool structured_split = false) {
     std::string model_name = model.empty() ? "gemini-2.5-flash" : model;
     Json::Value body(Json::objectValue);
     Json::Value system_instruction(Json::objectValue);
@@ -671,6 +673,28 @@ static std::string call_gemini(const std::string& key, const std::string& model,
     content["role"] = "user";
     content["parts"].append(user_part);
     body["contents"].append(content);
+    if (structured_split) {
+        Json::Value config(Json::objectValue);
+        config["responseMimeType"] = "application/json";
+        Json::Value schema(Json::objectValue);
+        schema["type"] = "object";
+        Json::Value sections_schema(Json::objectValue);
+        sections_schema["type"] = "array";
+        Json::Value item(Json::objectValue);
+        item["type"] = "object";
+        item["properties"]["title"]["type"] = "string";
+        item["properties"]["kind"]["type"] = "string";
+        item["properties"]["start_page_index"]["type"] = "integer";
+        item["properties"]["filename"]["type"] = "string";
+        item["required"].append("title");
+        item["required"].append("kind");
+        item["required"].append("start_page_index");
+        sections_schema["items"] = item;
+        schema["properties"]["sections"] = sections_schema;
+        schema["required"].append("sections");
+        config["responseSchema"] = schema;
+        body["generationConfig"] = config;
+    }
     Json::StreamWriterBuilder builder;
     std::string request = Json::writeString(builder, body);
     std::string url = "https://generativelanguage.googleapis.com/v1beta/models/" +
@@ -713,25 +737,318 @@ static void set_job(const std::string& id, const std::string& status,
     job.error = error;
 }
 
+static std::string sanitize_pdf_filename_native(const std::string& name,
+                                                const std::string& fallback);
+
 static Json::Value parse_sections(const std::string& raw, int total) {
-    size_t begin = raw.find('{');
-    size_t end = raw.rfind('}');
+    std::string cleaned = raw;
+    static const std::regex fence(R"(^```(?:json)?\s*|\s*```$)",
+                                  std::regex::icase);
+    cleaned = std::regex_replace(cleaned, fence, "");
+    cleaned = trim(cleaned);
+    size_t begin = cleaned.find('{');
+    size_t end = cleaned.rfind('}');
     std::string json_text = begin == std::string::npos || end < begin
-        ? raw : raw.substr(begin, end - begin + 1);
+        ? cleaned : cleaned.substr(begin, end - begin + 1);
     Json::Value parsed = parse_json(json_text);
     Json::Value sections = parsed["sections"];
+    if (!sections.isArray() && parsed.isMember("chapters"))
+        sections = parsed["chapters"];
     if (!sections.isArray()) return Json::arrayValue;
     Json::Value normalized(Json::arrayValue);
+    std::set<int> seen;
     for (const Json::Value& section : sections) {
-        int start = section["start_page_index"].asInt();
+        int start = section.isMember("start_page_index")
+            ? section["start_page_index"].asInt()
+            : section["start_unit"].asInt();
         if (start < 0 || start >= total) continue;
+        if (seen.count(start)) continue;
+        seen.insert(start);
         Json::Value item(Json::objectValue);
         item["title"] = section["title"].asString();
-        item["kind"] = section["kind"].asString();
+        std::string kind = section["kind"].asString();
+        if (kind == "frontmatter" || kind == "chapter" || kind == "backmatter")
+            item["kind"] = kind;
+        else
+            item["kind"] = "chapter";
+        if (section.isMember("filename"))
+            item["filename"] = sanitize_pdf_filename_native(
+                section["filename"].asString(),
+                section["title"].asString());
         item["start_unit"] = start;
         normalized.append(item);
     }
+    if (!normalized.empty() &&
+        normalized[0]["start_unit"].asInt() != 0) {
+        Json::Value first(Json::objectValue);
+        first["title"] = "Front Matter";
+        first["kind"] = "frontmatter";
+        first["filename"] = "00_Front_Matter";
+        first["start_unit"] = 0;
+        Json::Value with_first(Json::arrayValue);
+        with_first.append(first);
+        for (const Json::Value& section : normalized)
+            with_first.append(section);
+        normalized = with_first;
+    }
+    std::vector<Json::Value> sorted;
+    for (const Json::Value& section : normalized)
+        sorted.push_back(section);
+    std::sort(sorted.begin(), sorted.end(),
+        [](const Json::Value& a, const Json::Value& b) {
+            return a["start_unit"].asInt() < b["start_unit"].asInt();
+        });
+    normalized = Json::arrayValue;
+    for (const Json::Value& section : sorted)
+        normalized.append(section);
     return normalized;
+}
+
+static std::string normalized_boundary_text(const std::string& text) {
+    std::string out;
+    for (unsigned char c : text) {
+        if (std::isalnum(c)) out += static_cast<char>(std::tolower(c));
+    }
+    return out;
+}
+
+static std::string sanitize_title_native(const std::string& title) {
+    std::string out;
+    for (unsigned char c : title) {
+        if (std::isalnum(c) || c == '-' || c == '_') out += static_cast<char>(std::tolower(c));
+        else if (std::isspace(c) || c == '.') {
+            if (!out.empty() && out.back() != '_') out += '_';
+        }
+    }
+    if (out.empty()) return "section";
+    if (out.size() > 60) out.resize(60);
+    while (!out.empty() && (out.back() == '_' || out.back() == '-'))
+        out.pop_back();
+    return out.empty() ? "section" : out;
+}
+
+static std::string sanitize_pdf_filename_native(const std::string& name,
+                                                const std::string& fallback) {
+    std::string out;
+    for (unsigned char c : name) {
+        if (std::isalnum(c) || c == '-' || c == '.' || c == '_' ||
+            std::isspace(c)) {
+            if (std::isspace(c)) {
+                if (!out.empty() && out.back() != '_') out += '_';
+            } else {
+                out += static_cast<char>(c);
+            }
+        }
+    }
+    while (!out.empty() && (out.front() == '.' || out.front() == '_' ||
+                            out.front() == '-' || std::isspace(out.front())))
+        out.erase(out.begin());
+    while (!out.empty() && (out.back() == '.' || out.back() == '_' ||
+                            out.back() == '-' || std::isspace(out.back())))
+        out.pop_back();
+    if (out.empty()) out = sanitize_title_native(fallback);
+    if (out.size() > 80) out.resize(80);
+    return out;
+}
+
+static bool begins_numbered_chapter(const std::string& title) {
+    static const std::regex numbered(
+        R"(^\s*(?:(?:chapter)\s+)?\d{1,2}[.:)]?\s+)",
+        std::regex::icase);
+    return std::regex_search(title, numbered);
+}
+
+static bool is_part_heading(const std::string& title) {
+    static const std::regex part(R"(^\s*(?:part|section)\s+)",
+                                 std::regex::icase);
+    return std::regex_search(title, part);
+}
+
+static void normalize_pdf_sections(Json::Value& sections) {
+    Json::Value normalized(Json::arrayValue);
+    for (const Json::Value& section : sections) {
+        std::string title = section["title"].asString();
+        std::string normalized_title = normalized_boundary_text(title);
+        if (normalized_title == "blankpage" ||
+            normalized_title == "thispageintentionallyleftblank")
+            continue;
+        static const std::regex continuation(
+            R"(^(.*?)\s+(?:page\s+\d+|continued(?:\s+\d+)?)$)",
+            std::regex::icase);
+        std::smatch match;
+        if (std::regex_match(title, match, continuation) &&
+            !normalized.empty()) {
+            std::string base = match[1].str();
+            std::string previous = normalized[normalized.size() - 1]["title"].asString();
+            if (normalized_boundary_text(base) ==
+                normalized_boundary_text(previous))
+                continue;
+        }
+        normalized.append(section);
+    }
+    if (normalized.empty()) return;
+    normalized[0]["start_unit"] = 0;
+
+    Json::ArrayIndex i = 0;
+    while (i + 1 < normalized.size()) {
+        std::string title = normalized[i]["title"].asString();
+        std::string next_title = normalized[i + 1]["title"].asString();
+        int current = normalized[i]["start_unit"].asInt();
+        int following = normalized[i + 1]["start_unit"].asInt();
+        bool nearby_numbered =
+            normalized[i]["kind"].asString() == "chapter" &&
+            normalized[i + 1]["kind"].asString() == "chapter" &&
+            begins_numbered_chapter(next_title) &&
+            following > current && following - current <= 2;
+        if (is_part_heading(title) || nearby_numbered) {
+            normalized[i + 1]["start_unit"] = current;
+            normalized.removeIndex(i, nullptr);
+            i = 0;
+        } else {
+            ++i;
+        }
+    }
+    sections = normalized;
+}
+
+static void align_pdf_section_starts_native(Json::Value& sections,
+                                             const fs::path& path) {
+    std::unique_ptr<poppler::document> document(
+        poppler::document::load_from_file(path.string()));
+    if (!document) return;
+    for (Json::ArrayIndex i = 1; i < sections.size(); ++i) {
+        int start = sections[i]["start_unit"].asInt();
+        int previous = sections[i - 1]["start_unit"].asInt();
+        std::string title = normalized_boundary_text(
+            sections[i]["title"].asString());
+        if (start <= previous + 1 || title.size() < 12) continue;
+        int previous_page = start - 1;
+        if (previous_page < 0) continue;
+        std::unique_ptr<poppler::page> page(document->create_page(previous_page));
+        if (!page) continue;
+        poppler::byte_array bytes = page->text().to_utf8();
+        std::string text(bytes.begin(), bytes.end());
+        for (char& c : text) c = static_cast<char>(std::tolower(
+            static_cast<unsigned char>(c)));
+        std::string page_normalized;
+        for (unsigned char c : text)
+            if (std::isalnum(c)) page_normalized += static_cast<char>(c);
+        if (page_normalized.find(title) != std::string::npos)
+            sections[i]["start_unit"] = previous_page;
+    }
+}
+
+static std::vector<std::string> build_pdf_outline(const fs::path& path, int total) {
+    std::vector<std::string> lines;
+    std::unique_ptr<poppler::document> document(
+        poppler::document::load_from_file(path.string()));
+    if (!document) return lines;
+    for (int i = 0; i < total; ++i) {
+        std::unique_ptr<poppler::page> page(document->create_page(i));
+        std::string text;
+        if (page) {
+            poppler::byte_array bytes = page->text(
+                poppler::rectf(), poppler::page::raw_order_layout).to_utf8();
+            text.append(bytes.begin(), bytes.end());
+        }
+        std::string compact;
+        std::istringstream input(text);
+        std::string line;
+        int line_count = 0;
+        while (std::getline(input, line) && line_count < 8) {
+            line = trim(line);
+            if (!line.empty()) {
+                if (!compact.empty()) compact += "; ";
+                compact += line;
+                ++line_count;
+            }
+        }
+        if (compact.size() > 140) compact.resize(140);
+        lines.push_back("[" + std::to_string(i) + "] " + compact);
+    }
+    return lines;
+}
+
+static std::string truncate_outline_native(const std::vector<std::string>& lines,
+                                           size_t max_chars,
+                                           bool& truncated) {
+    std::string text;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        if (i) text += "\n";
+        text += lines[i];
+    }
+    if (text.size() <= max_chars) {
+        truncated = false;
+        return text;
+    }
+
+    truncated = true;
+    const std::string marker =
+        "[Outline sampled evenly across the document due to length.]";
+    size_t budget = max_chars > marker.size() + 1
+        ? max_chars - marker.size() - 1 : max_chars;
+    size_t count = std::min(lines.size(),
+        std::max<size_t>(2, lines.size() * budget / std::max<size_t>(1, text.size())));
+
+    while (count >= 2) {
+        size_t edge_count = std::min(std::max<size_t>(1, count / 10),
+                                     lines.size() / 3);
+        size_t middle_start = edge_count;
+        size_t middle_end = lines.size() - edge_count;
+        size_t middle_count = count > edge_count * 2
+            ? count - edge_count * 2 : 0;
+        std::vector<size_t> indexes;
+        for (size_t i = 0; i < edge_count; ++i) indexes.push_back(i);
+        if (middle_count == 1)
+            indexes.push_back((middle_start + middle_end - 1) / 2);
+        else if (middle_count > 1) {
+            for (size_t i = 0; i < middle_count; ++i) {
+                size_t value = middle_start +
+                    (i * (middle_end - middle_start - 1) / (middle_count - 1));
+                indexes.push_back(value);
+            }
+        }
+        for (size_t i = lines.size() - edge_count; i < lines.size(); ++i)
+            indexes.push_back(i);
+        std::sort(indexes.begin(), indexes.end());
+        indexes.erase(std::unique(indexes.begin(), indexes.end()), indexes.end());
+
+        std::string sampled = marker;
+        for (size_t i : indexes) sampled += "\n" + lines[i];
+        if (sampled.size() <= max_chars) return sampled;
+        if (count == 2) break;
+        count = std::max<size_t>(2, std::min<size_t>(count - 1,
+            count * budget / std::max<size_t>(1, sampled.size())));
+    }
+    return text.substr(0, max_chars);
+}
+
+static std::string build_native_split_prompt(const std::vector<std::string>& lines,
+                                             int total,
+                                             bool& truncated) {
+    std::string outline = truncate_outline_native(lines, 40000, truncated);
+    std::ostringstream prompt;
+    prompt
+        << "The PDF has " << total << " physical pages indexed from 0. "
+        << "Split the book at chapter level so each chapter becomes its own standalone PDF.\n\n"
+        << "CRITICAL: Do NOT group all front matter into one section, and do NOT group all back matter into one. "
+        << "Each distinct front-matter or back-matter item must be its OWN section. "
+        << "Examples: cover, copyright, dedication, table of contents, foreword, preface, acknowledgements, "
+        << "appendix, glossary, bibliography, index, colophon, and about the author.\n\n"
+        << "CHAPTER-LEVEL SPLITTING: Each numbered chapter must be its own section, even after a Part heading. "
+        << "Do NOT group all chapters in a Part into one section. Include an immediately preceding Part page "
+        << "with the first chapter rather than creating a separate Part file. "
+        << "Do not split on subheadings, running headers, or contents-only entries.\n\n"
+        << "BOUNDARY COORDINATES ARE ZERO-BASED PHYSICAL PDF PAGE INDICES, NOT PRINTED PAGE NUMBERS. "
+        << "Copy the bracketed index of each section's first page into start_page_index.\n\n"
+        << "Return STRICT JSON, no prose: "
+        << "{\\\"sections\\\":[{\\\"title\\\":\\\"Human title\\\",\\\"kind\\\":"
+        << "\\\"frontmatter|chapter|backmatter\\\",\\\"start_page_index\\\":0,\\\"filename\\\":\\\"ascii_name\\\"}]}\n"
+        << "Starts must be strictly increasing, the first is 0, and each section ends before the next starts.\n"
+        << "Front/back matter use number=null and filename prefixed 00_ or 99_. "
+        << "Filenames use ASCII letters/digits/underscores only and are at most 80 characters.\n\n"
+        << "OUTLINE:\n" << outline;
+    return prompt.str();
 }
 
 static void run_ai_split_job(const std::string& job_id, const Record& record,
@@ -740,36 +1057,52 @@ static void run_ai_split_job(const std::string& job_id, const Record& record,
     try {
         set_job(job_id, "running", "extracting", 10);
         std::string text = extract_text(record.path, record.ext);
-        if (text.size() > 40000) {
+        bool truncated = false;
+        std::string prompt_outline;
+        int total = 0;
+        if (record.ext == "pdf") {
+            std::unique_ptr<poppler::document> document(
+                poppler::document::load_from_file(record.path.string()));
+            if (!document) throw std::runtime_error("Could not read PDF.");
+            total = document->pages();
+            if (total < 2) throw std::runtime_error("Document is too short to split into chapters.");
+            auto lines = build_pdf_outline(record.path, total);
+            prompt_outline = build_native_split_prompt(lines, total, truncated);
+        } else {
+            total = static_cast<int>(heading_parts(text).size());
+            if (total < 2) throw std::runtime_error("Document is too short to split into chapters.");
+            prompt_outline = "Below is an outline of a document broken into " +
+                             std::to_string(total) + " units numbered from 0.\n"
+                             "Identify natural section boundaries and return strict JSON:\n"
+                             "{\"sections\":[{\"title\":\"string\",\"start_unit\":0}]}.\n\n"
+                             "OUTLINE:\n";
+            std::string sampled = text.size() > 40000
+                ? text.substr(0, 20000) + "\n[...document truncated...]\n" +
+                  text.substr(text.size() - 20000)
+                : text;
+            truncated = sampled.size() != text.size();
+            prompt_outline += sampled;
+        }
+        if (truncated) {
             std::lock_guard<std::mutex> lock(jobs_mutex);
             jobs[job_id].truncated = true;
-            text = text.substr(0, 20000) + "\n[... document truncated ...]\n" +
-                   text.substr(text.size() - 20000);
         }
         set_job(job_id, "running", "analyzing", 45);
         std::string system =
             "Return only JSON with a sections array. Every section needs title, "
             "kind (frontmatter, chapter, or backmatter), and start_page_index.";
-        std::string prompt =
-            "Analyze this document and identify chapter-level section boundaries. "
-            "Use zero-based physical page indices. Keep front matter and back matter "
-            "separate from chapters.\n\n" + text;
         std::string raw = provider == "claude"
-            ? call_claude(key, model, system, prompt)
-            : call_gemini(key, model, system, prompt);
-        int total = 0;
-        if (record.ext == "pdf") {
-            std::unique_ptr<poppler::document> document(
-                poppler::document::load_from_file(record.path.string()));
-            if (document) total = document->pages();
-        } else {
-            total = static_cast<int>(heading_parts(text).size());
-        }
+            ? call_claude(key, model, system, prompt_outline)
+            : call_gemini(key, model, system, prompt_outline, true);
         Json::Value sections = parse_sections(raw, total);
         if (sections.empty()) throw std::runtime_error("AI returned no valid sections.");
+        if (record.ext == "pdf")
+            align_pdf_section_starts_native(sections, record.path);
+        normalize_pdf_sections(sections);
         set_job(job_id, "running", "splitting", 75);
 
         Json::Value chapters(Json::arrayValue);
+        int chapter_number = 0;
         for (Json::ArrayIndex i = 0; i < sections.size(); ++i) {
             int first = sections[i]["start_unit"].asInt();
             int last = i + 1 < sections.size()
@@ -810,8 +1143,29 @@ static void run_ai_split_job(const std::string& job_id, const Record& record,
                     sections[i]["title"].asString());
             }
             if (!created) continue;
-            std::string filename = safe_stem(sections[i]["title"].asString()) + "." +
-                                   (target.empty() ? "pdf" : target);
+            std::string title = sections[i]["title"].asString();
+            std::string filename;
+            if (record.ext == "pdf") {
+                std::string kind = sections[i]["kind"].asString();
+                int number;
+                if (kind == "frontmatter") number = 0;
+                else if (kind == "backmatter") number = 99;
+                else number = ++chapter_number;
+                int width = total >= 1000 ? 4 : 3;
+                char first_text[16], last_text[16];
+                std::snprintf(first_text, sizeof(first_text), "%0*d", width, first + 1);
+                std::snprintf(last_text, sizeof(last_text), "%0*d", width, last + 1);
+                filename = "pages_" + std::string(first_text) + "_" +
+                           std::string(last_text) + "_" +
+                           (number < 10 ? "0" : "") + std::to_string(number) +
+                           "_" + sanitize_title_native(title) + "." +
+                           (target.empty() ? "pdf" : target);
+            } else {
+                filename = sections[i].isMember("filename")
+                    ? sanitize_pdf_filename_native(sections[i]["filename"].asString(), title)
+                    : safe_stem(title);
+                filename += "." + (target.empty() ? "txt" : target);
+            }
             outputs[id] = {id, filename,
                            target.empty() ? "pdf" : target, path};
             Json::Value chapter(Json::objectValue);

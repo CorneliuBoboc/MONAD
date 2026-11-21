@@ -1,1 +1,1 @@
-lauboth.sh
+lau.native.sh
