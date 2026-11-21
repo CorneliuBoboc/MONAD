@@ -1,3 +1,0 @@
-/home/ubuntu/code/Danielzapirtan/MONAD/┃/CMakeFiles/morphix_cpp.dir
-/home/ubuntu/code/Danielzapirtan/MONAD/┃/CMakeFiles/edit_cache.dir
-/home/ubuntu/code/Danielzapirtan/MONAD/┃/CMakeFiles/rebuild_cache.dir
