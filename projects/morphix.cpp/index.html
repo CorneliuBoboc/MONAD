@@ -1,0 +1,799 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Document Utilities</title>
+<style>
+  :root{
+    --bg:#E7EAEE; --bg-panel:#F4F5F3; --ink:#1B2430; --ink-soft:#4B5563;
+    --line:#C7CDD6; --accent:#8A6A2F; --accent-ink:#5C4720; --accent-soft:#EFE6D2;
+    --danger:#9A3B2E; --danger-bg:#F6E4E0; --radius:10px;
+    --serif:'Iowan Old Style','Palatino Linotype',Palatino,Georgia,serif;
+    --sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
+    --mono:ui-monospace,SFMono-Regular,Consolas,Menlo,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);
+       -webkit-font-smoothing:antialiased;}
+  .shell{max-width:880px;margin:0 auto;padding:28px 20px 60px}
+  header.site{display:flex;align-items:baseline;justify-content:space-between;
+       border-bottom:2px solid var(--ink);padding-bottom:14px;margin-bottom:22px}
+  header.site h2{font-family:var(--serif);font-weight:600;font-size:1.7rem;margin:0;
+       letter-spacing:.2px}
+  header.site .kicker{font-family:var(--mono);font-size:.72rem;letter-spacing:.08em;
+       text-transform:uppercase;color:var(--ink-soft)}
+  .tab-bar{display:flex;gap:2px;margin-bottom:0;flex-wrap:wrap}
+  .tab-btn{font-family:var(--mono);font-size:.78rem;letter-spacing:.03em;
+       background:var(--bg);border:1px solid var(--line);border-bottom:none;
+       color:var(--ink-soft);padding:10px 16px;cursor:pointer;border-radius:8px 8px 0 0;
+       display:flex;align-items:center;gap:8px;transition:background .15s,color .15s}
+  .tab-btn .n{display:inline-flex;align-items:center;justify-content:center;
+       width:18px;height:18px;border-radius:50%;border:1px solid currentColor;font-size:.68rem}
+  .tab-btn.active{background:var(--bg-panel);color:var(--ink);border-color:var(--ink);
+       font-weight:600}
+  .tab-btn:disabled{opacity:.4;cursor:not-allowed}
+  .tab-btn:not(.active):not(:disabled):hover{color:var(--ink)}
+  .panel{background:var(--bg-panel);border:1px solid var(--ink);border-radius:0 8px 8px 8px;
+       padding:26px;min-height:220px}
+  .tab-panel{display:none}
+  .tab-panel.active{display:block}
+  h3.panel-title{font-family:var(--serif);margin:0 0 6px;font-size:1.2rem}
+  p.hint{color:var(--ink-soft);font-size:.88rem;margin:0 0 18px;line-height:1.5}
+  .dropzone{border:2px dashed var(--line);border-radius:var(--radius);padding:38px 20px;
+       text-align:center;cursor:pointer;transition:border-color .15s,background .15s;background:#FBFBF9}
+  .dropzone.drag{border-color:var(--accent);background:var(--accent-soft)}
+  .dropzone .big{font-family:var(--serif);font-size:1.05rem;margin-bottom:6px}
+  .dropzone .small{font-family:var(--mono);font-size:.72rem;color:var(--ink-soft)}
+  input[type=file]{display:none}
+  .file-card{margin-top:16px;border:1px solid var(--line);border-radius:var(--radius);
+       padding:14px 16px;display:flex;justify-content:space-between;align-items:center;
+       background:#fff}
+  .file-card .name{font-weight:600}
+  .file-card .meta{font-family:var(--mono);font-size:.76rem;color:var(--ink-soft);margin-top:2px}
+  select, input[type=text], input[type=password], textarea{
+       font-family:var(--sans);font-size:.92rem;padding:9px 11px;border:1px solid var(--line);
+       border-radius:7px;background:#fff;color:var(--ink);width:100%}
+  select{font-family:var(--sans)}
+  label.field{display:block;font-size:.78rem;color:var(--ink-soft);margin:14px 0 5px;
+       font-family:var(--mono);text-transform:uppercase;letter-spacing:.04em}
+  .op-list{display:flex;flex-direction:column;gap:8px;margin-top:6px}
+  .op-item{border:1px solid var(--line);border-radius:var(--radius);padding:12px 14px;
+       cursor:pointer;background:#fff;display:flex;align-items:center;gap:10px}
+  .op-item input{margin:0}
+  .op-item.selected{border-color:var(--accent);background:var(--accent-soft)}
+  .op-item .lbl{font-weight:600;font-size:.94rem}
+  .op-item .desc{font-size:.8rem;color:var(--ink-soft);margin-top:2px}
+  .op-item.disabled-op{opacity:.45;cursor:not-allowed;background:#EFEFEF}
+  .op-item.disabled-op .lbl{color:var(--ink-soft)}
+  .ctrl-block{display:none}
+  .ctrl-block.active{display:block}
+  .api-box{margin-top:18px;border:1px dashed var(--accent);border-radius:var(--radius);
+       padding:14px 16px;background:var(--accent-soft)}
+  .api-box .row{display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
+  .api-box label.inline{display:flex;align-items:center;gap:7px;font-size:.86rem;cursor:pointer}
+  .radio-row{display:flex;gap:16px;flex-wrap:wrap;margin-top:6px}
+  .radio-row label{display:flex;align-items:center;gap:6px;font-size:.88rem;cursor:pointer}
+  .btn{font-family:var(--mono);font-size:.82rem;letter-spacing:.03em;text-transform:uppercase;
+       background:var(--ink);color:#fff;border:none;border-radius:7px;padding:11px 18px;
+       cursor:pointer;transition:opacity .15s}
+  .btn:hover{opacity:.85}
+  .btn:disabled{opacity:.4;cursor:not-allowed}
+  .btn.secondary{background:#fff;color:var(--ink);border:1px solid var(--ink)}
+  .btn.accent{background:var(--accent);}
+  .actions{margin-top:20px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+  .status{font-size:.85rem;margin-top:10px;min-height:1.2em}
+  .status.err{color:var(--danger);background:var(--danger-bg);padding:8px 12px;border-radius:7px}
+  .status.ok{color:#1E5C34}
+  .status.busy{color:var(--ink-soft)}
+  .status .phase{font-family:var(--mono);font-size:.76rem;letter-spacing:.03em;
+       text-transform:uppercase;color:var(--ink-soft);margin-left:8px}
+  .progress{height:4px;background:var(--line);border-radius:2px;overflow:hidden;margin-top:8px}
+  .progress .bar{height:100%;background:var(--accent);width:0%;
+       transition:width .3s ease}
+  textarea{min-height:220px;font-family:var(--mono);font-size:.84rem;line-height:1.5;resize:vertical}
+  .results-grid{display:flex;flex-direction:column;gap:10px;margin-top:14px}
+  .ticket{display:flex;justify-content:space-between;align-items:center;background:#fff;
+       border:1px solid var(--line);border-left:3px dashed var(--accent);border-radius:6px;
+       padding:11px 14px}
+  .ticket .fname{font-family:var(--mono);font-size:.86rem}
+  .ticket .title{font-size:.78rem;color:var(--ink-soft);margin-top:2px}
+  .ticket a.dl{font-family:var(--mono);font-size:.76rem;text-decoration:none;color:var(--accent-ink);
+       border:1px solid var(--accent);border-radius:6px;padding:6px 10px;white-space:nowrap}
+  .ticket a.dl:hover{background:var(--accent-soft)}
+  .empty-note{color:var(--ink-soft);font-size:.88rem;font-style:italic}
+  .file-list{margin-top:8px;display:flex;flex-direction:column;gap:4px}
+  .file-list .row{font-family:var(--mono);font-size:.78rem;color:var(--ink-soft);
+       display:flex;justify-content:space-between;gap:12px}
+  .file-list .row .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:400px}
+  footer.site{margin-top:36px;padding-top:14px;border-top:1px solid var(--line);
+       font-family:var(--mono);font-size:.72rem;color:var(--ink-soft);text-align:center}
+  @media (max-width:600px){.panel{padding:18px}}
+  :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+</style>
+</head>
+<body>
+<div class="shell">
+  <header class="site">
+    <h2>Document Utilities</h2>
+    <span class="kicker">convert &middot; split &middot; outline</span>
+  </header>
+
+  <nav class="tab-bar">
+    <button class="tab-btn active" data-tab="document"><span class="n">1</span>Document</button>
+    <button class="tab-btn" data-tab="operation" disabled><span class="n">2</span>Operation</button>
+    <button class="tab-btn" data-tab="controls" disabled><span class="n">3</span>Configure</button>
+    <button class="tab-btn" data-tab="results" disabled><span class="n">4</span>Results</button>
+  </nav>
+
+  <main class="panel">
+
+    <!-- TAB 1: DOCUMENT -->
+    <section class="tab-panel active" id="tab-document">
+      <h3 class="panel-title">Upload document(s)</h3>
+      <p class="hint">Supports PDF, DOCX, AZW3, EPUB, Markdown, HTML and TXT &mdash; up to 150&nbsp;MB per upload. Add files from several folders; the pool stays open until you choose an operation.</p>
+      <div class="dropzone" id="dropzone" tabindex="0" role="button" aria-label="Upload files">
+        <div class="big">Drop files here, or click to choose one or more</div>
+        <div class="small">.pdf &nbsp;.docx &nbsp;.azw3 &nbsp;.epub &nbsp;.md &nbsp;.html &nbsp;.txt</div>
+      </div>
+      <input type="file" id="fileInput" multiple accept=".pdf,.docx,.azw3,.epub,.md,.markdown,.html,.htm,.txt">
+      <div id="fileCard" style="display:none" class="file-card">
+        <div style="flex:1;min-width:0">
+          <div class="name" id="fileName"></div>
+          <div class="meta" id="fileMeta"></div>
+          <div class="file-list" id="fileList"></div>
+        </div>
+        <button class="btn secondary" id="changeFileBtn" type="button">Clear file pool</button>
+      </div>
+      <div class="status" id="uploadStatus"></div>
+      <div class="actions">
+        <button class="btn" id="toOperationBtn" disabled type="button">Choose operation &rarr;</button>
+      </div>
+    </section>
+
+    <!-- TAB 2: OPERATION -->
+    <section class="tab-panel" id="tab-operation">
+      <h3 class="panel-title">Choose an operation</h3>
+      <p class="hint">What would you like to do with this document?</p>
+      <div class="op-list" id="opList">
+        <label class="op-item" data-op="convert">
+          <input type="radio" name="op" value="convert">
+          <div><div class="lbl">Convert to another format</div>
+          <div class="desc">Re-render headings and paragraphs into PDF, DOCX, EPUB, Markdown, HTML or TXT. Works on one or many files.</div></div>
+        </label>
+        <label class="op-item" data-op="split">
+          <input type="radio" name="op" value="split">
+          <div><div class="lbl">Split by page / range</div>
+          <div class="desc">Cut a PDF by page ranges, an EPUB by chapter, or another format by top-level sections. (Single file only.)</div></div>
+        </label>
+        <label class="op-item" data-op="ai-split">
+          <input type="radio" name="op" value="ai-split">
+          <div><div class="lbl">Split smart by chapters (AI)</div>
+          <div class="desc">Let Claude or Gemini find natural chapter boundaries and split accordingly. (Single file only.)</div></div>
+        </label>
+        <label class="op-item" data-op="ai-toc">
+          <input type="radio" name="op" value="ai-toc">
+          <div><div class="lbl">Make an extremely detailed TOC (AI)</div>
+          <div class="desc">Ask Claude or Gemini to generate a deeply nested table of contents. (Single file only.)</div></div>
+        </label>
+      </div>
+      <div class="actions">
+        <button class="btn secondary" data-tab="document" type="button">&larr; Back</button>
+        <button class="btn" id="toControlsBtn" disabled type="button">Configure &rarr;</button>
+      </div>
+    </section>
+
+    <!-- TAB 3: CONTROLS -->
+    <section class="tab-panel" id="tab-controls">
+      <h3 class="panel-title" id="controlsTitle">Configure</h3>
+      <p class="hint" id="controlsHint"></p>
+
+      <div class="ctrl-block" id="ctrl-convert">
+        <label class="field">Target format</label>
+        <select id="convertTarget">
+          <option value="pdf">PDF</option>
+          <option value="docx">DOCX (Word)</option>
+          <option value="epub">EPUB</option>
+          <option value="md">Markdown</option>
+          <option value="html">HTML</option>
+          <option value="txt">Plain text</option>
+        </select>
+        <div class="actions"><button class="btn accent" id="runConvertBtn" type="button">Convert</button></div>
+        <div class="status" id="convertStatus"></div>
+      </div>
+
+      <div class="ctrl-block" id="ctrl-split">
+        <label class="field" id="splitUnitLabel">Pages</label>
+        <div class="radio-row">
+          <label><input type="radio" name="splitMode" value="each" checked> Each unit as its own file</label>
+          <label><input type="radio" name="splitMode" value="everyn"> Every N units</label>
+          <label><input type="radio" name="splitMode" value="custom"> Custom ranges</label>
+        </div>
+        <div id="everyNWrap" style="display:none">
+          <label class="field">N</label>
+          <input type="text" id="everyN" value="1">
+        </div>
+        <div id="customWrap" style="display:none">
+          <label class="field">Ranges (e.g. 1-3,5,7-9)</label>
+          <input type="text" id="customRanges" placeholder="1-3,5,7-9">
+        </div>
+        <label class="field">Output format</label>
+        <select id="splitTarget"></select>
+        <div class="actions"><button class="btn accent" id="runSplitBtn" type="button">Split document</button></div>
+        <div class="status" id="splitStatus"></div>
+      </div>
+
+      <div class="ctrl-block" id="ctrl-ai-split">
+        <label class="field">Output format for each chapter</label>
+        <select id="aiSplitTarget"></select>
+        <div id="apiBoxSplit"></div>
+        <div class="actions"><button class="btn accent" id="runAiSplitBtn" type="button">Analyze &amp; split</button></div>
+        <div class="status" id="aiSplitStatus"></div>
+        <div class="progress" id="aiSplitProgressWrap" style="display:none">
+          <div class="bar" id="aiSplitProgressBar"></div>
+        </div>
+      </div>
+
+      <div class="ctrl-block" id="ctrl-ai-toc">
+        <label class="field">Detail level</label>
+        <select id="tocDepth">
+          <option value="detailed, with subsections and key topics" selected>Detailed</option>
+          <option value="extremely detailed and exhaustive, with sub-subsections and key topics per section">Extremely detailed</option>
+          <option value="concise, top-level only">Concise (top level only)</option>
+        </select>
+        <div id="apiBoxToc"></div>
+        <div class="actions"><button class="btn accent" id="runAiTocBtn" type="button">Generate TOC</button></div>
+        <div class="status" id="aiTocStatus"></div>
+      </div>
+
+      <div class="actions">
+        <button class="btn secondary" data-tab="operation" type="button">&larr; Back</button>
+      </div>
+    </section>
+
+    <!-- TAB 4: RESULTS -->
+    <section class="tab-panel" id="tab-results">
+      <h3 class="panel-title">Results</h3>
+      <div id="tocPreviewWrap" style="display:none">
+        <label class="field">Preview</label>
+        <textarea id="tocPreview" readonly></textarea>
+        <div class="actions"><button class="btn secondary" id="copyTocBtn" type="button">Copy text</button></div>
+      </div>
+      <label class="field" style="margin-top:22px">Downloadable files</label>
+      <div class="results-grid" id="resultsGrid">
+        <div class="empty-note">Nothing produced yet.</div>
+      </div>
+      <div class="actions">
+        <button class="btn" id="downloadAllBtn" disabled type="button">Download all (.zip)</button>
+        <button class="btn secondary" data-tab="operation" type="button">Run another operation</button>
+      </div>
+    </section>
+
+  </main>
+
+  <footer class="site">&copy; <span id="year"></span> &mdash; Document Utilities. Local processing utility; API keys are never stored.</footer>
+</div>
+
+<template id="apiBoxTemplate">
+  <div class="api-box">
+    <div class="row">
+      <label class="inline"><input type="checkbox" class="use-api" checked disabled> Use AI API</label>
+      <select class="provider">
+        <option value="gemini">Gemini (Google)</option>
+        <option value="claude">Claude (Anthropic)</option>
+      </select>
+    </div>
+    <div class="row">
+      <label class="inline"><input type="checkbox" class="enter-key"> Enter my own API key</label>
+    </div>
+    <div class="key-wrap" style="display:none">
+      <label class="field">API key</label>
+      <input type="password" class="api-key" autocomplete="off" placeholder="sk-... / AIza...">
+      <label class="field">Model (optional override)</label>
+      <input type="text" class="model" placeholder="e.g. claude-sonnet-5">
+    </div>
+    <p class="hint" style="margin:8px 0 0">If left unchecked, the server's own API key (environment variable) is used, if configured.</p>
+  </div>
+</template>
+
+<script>
+(function(){
+  "use strict";
+  document.getElementById('year').textContent = new Date().getFullYear();
+
+  var state = { files: [], op: null, outputs: [] };
+
+  function $(sel, root){ return (root||document).querySelector(sel); }
+  function $all(sel, root){ return Array.prototype.slice.call((root||document).querySelectorAll(sel)); }
+
+  // ---- Tabs ----------------------------------------------------------
+  function activateTab(name){
+    $all('.tab-btn').forEach(function(b){ b.classList.toggle('active', b.dataset.tab===name); });
+    $all('.tab-panel').forEach(function(p){ p.classList.toggle('active', p.id==='tab-'+name); });
+  }
+  $all('[data-tab]').forEach(function(el){
+    el.addEventListener('click', function(){
+      if (el.disabled) return;
+      activateTab(el.dataset.tab);
+    });
+  });
+
+  function unlockTab(name){
+    var btn = $all('.tab-btn').filter(function(b){ return b.dataset.tab===name; })[0];
+    if (btn) btn.disabled = false;
+  }
+
+  // ---- Status helpers --------------------------------------------------
+  function setStatus(el, msg, kind, phase){
+    el.innerHTML = '';
+    if (msg) {
+      var span = document.createElement('span');
+      span.textContent = msg;
+      el.appendChild(span);
+    }
+    if (phase) {
+      var ph = document.createElement('span');
+      ph.className = 'phase';
+      ph.textContent = phase;
+      el.appendChild(ph);
+    }
+    el.className = 'status' + (kind ? ' ' + kind : '');
+  }
+
+  // ---- Upload ------------------------------------------------------------
+  var dropzone = $('#dropzone'), fileInput = $('#fileInput');
+  dropzone.addEventListener('click', function(){ fileInput.click(); });
+  dropzone.addEventListener('keydown', function(e){ if(e.key==='Enter'||e.key===' ') fileInput.click(); });
+  ['dragenter','dragover'].forEach(function(ev){
+    dropzone.addEventListener(ev, function(e){ e.preventDefault(); dropzone.classList.add('drag'); });
+  });
+  ['dragleave','drop'].forEach(function(ev){
+    dropzone.addEventListener(ev, function(e){ e.preventDefault(); dropzone.classList.remove('drag'); });
+  });
+  dropzone.addEventListener('drop', function(e){
+    var fs = Array.prototype.slice.call(e.dataTransfer.files);
+    if (fs.length) uploadFiles(fs);
+  });
+  fileInput.addEventListener('change', function(){
+    var fs = Array.prototype.slice.call(fileInput.files);
+    if (fs.length) uploadFiles(fs);
+  });
+  $('#changeFileBtn').addEventListener('click', function(){
+    fileInput.value = '';
+    $('#fileCard').style.display = 'none';
+    dropzone.style.display = 'block';
+    $('#toOperationBtn').disabled = true;
+    state.files = [];
+    refreshOpAvailability();
+  });
+
+  function unitLabel(meta){
+    if (!meta || meta.units == null) return 'Could not determine document structure.';
+    var kind = meta.unit_kind === 'page' ? 'page' : (meta.unit_kind === 'chapter' ? 'chapter' : 'top-level section');
+    var n = meta.units;
+    return n + ' ' + kind + (n===1 ? '' : 's') + ' detected.';
+  }
+
+  function uploadFiles(fileList){
+    var statusEl = $('#uploadStatus');
+    setStatus(statusEl, 'Uploading ' + fileList.length + ' file(s) & analyzing\u2026', 'busy');
+    var fd = new FormData();
+    fileList.forEach(function(f){ fd.append('files', f); });
+    fetch('/api/upload-batch', { method:'POST', body: fd })
+      .then(function(r){ return r.json().then(function(j){ return {ok:r.ok, body:j}; }); })
+      .then(function(res){
+        if (!res.ok) { setStatus(statusEl, res.body.error || 'Upload failed.', 'err'); return; }
+        var uploaded = res.body.files || [];
+        if (!uploaded.length && !state.files.length) {
+          setStatus(statusEl, 'No usable files uploaded.', 'err');
+          return;
+        }
+        state.files = state.files.concat(uploaded);
+        $('#fileCard').style.display = state.files.length ? 'flex' : 'none';
+        renderFileCard();
+        var errs = res.body.errors || [];
+        if (errs.length) {
+          setStatus(statusEl,
+            errs.length + ' file(s) rejected: ' +
+            errs.map(function(e){ return e.filename + ' (' + e.error + ')'; }).join('; '),
+            'err');
+        } else {
+          setStatus(statusEl, state.files.length + ' file(s) ready. Add more or choose an operation.', 'ok');
+        }
+        $('#toOperationBtn').disabled = false;
+        unlockTab('operation');
+        refreshOpAvailability();
+      })
+      .catch(function(e){ setStatus(statusEl, 'Upload failed: ' + e, 'err'); });
+  }
+
+  function renderFileCard(){
+    if (state.files.length === 1) {
+      var f = state.files[0];
+      $('#fileName').textContent = f.filename;
+      $('#fileMeta').textContent = f.ext.toUpperCase() + '  \u00b7  ' + unitLabel(f.meta);
+      $('#fileList').innerHTML = '';
+    } else {
+      $('#fileName').textContent = state.files.length + ' files selected';
+      var detected = state.files.filter(function(f){ return f.meta && f.meta.units != null; }).length;
+      $('#fileMeta').textContent = 'Batch convert supported \u00b7 ' + detected + '/' + state.files.length + ' analyzed';
+      var listEl = $('#fileList');
+      listEl.innerHTML = '';
+      state.files.forEach(function(f){
+        var row = document.createElement('div');
+        row.className = 'row';
+        row.innerHTML = '<span class="nm">' + escapeHtml(f.filename) + '</span>' +
+                        '<span>' + f.ext.toUpperCase() + '</span>';
+        listEl.appendChild(row);
+      });
+    }
+  }
+
+  $('#toOperationBtn').addEventListener('click', function(){ activateTab('operation'); });
+
+  // ---- Operation selection --------------------------------------------
+  $all('.op-item').forEach(function(item){
+    item.addEventListener('click', function(e){
+      if (item.classList.contains('disabled-op')) { e.preventDefault(); return; }
+      $all('.op-item').forEach(function(o){ o.classList.remove('selected'); });
+      item.classList.add('selected');
+      item.querySelector('input').checked = true;
+      state.op = item.dataset.op;
+      $('#toControlsBtn').disabled = false;
+    });
+  });
+
+  function refreshOpAvailability(){
+    var multi = state.files.length > 1;
+    var hasAzw3 = state.files.some(function(f){ return f.ext === 'azw3'; });
+    $all('.op-item').forEach(function(o){
+      var singleOnly = o.dataset.op !== 'convert';
+      var blocked = (multi || hasAzw3) && singleOnly;
+      o.classList.toggle('disabled-op', blocked);
+      if (blocked && o.querySelector('input').checked) {
+        o.querySelector('input').checked = false;
+        o.classList.remove('selected');
+        state.op = null;
+        $('#toControlsBtn').disabled = true;
+      }
+    });
+  }
+
+  $('#toControlsBtn').addEventListener('click', function(){
+    renderControls();
+    activateTab('controls');
+  });
+
+  // ---- Controls panel ---------------------------------------------------
+  var TITLES = {
+    convert: ['Convert to another format', 'Pick the target format. All uploaded files will be converted.'],
+    split: ['Split by page / range', 'Choose how to divide the document.'],
+    'ai-split': ['Split smart by chapters', 'An AI model proposes chapter boundaries, then the document is split accordingly.'],
+    'ai-toc': ['Make a detailed table of contents', 'An AI model reads the document and drafts a nested table of contents.']
+  };
+
+  function populateFormatSelect(sel, excludeCurrent){
+    sel.innerHTML = '';
+    var formats = [['pdf','PDF'],['docx','DOCX (Word)'],['epub','EPUB'],['md','Markdown'],['html','HTML'],['txt','Plain text']];
+    formats.forEach(function(pair){
+      var opt = document.createElement('option');
+      opt.value = pair[0]; opt.textContent = pair[1];
+      sel.appendChild(opt);
+    });
+    var f = state.files[0];
+    if (f && excludeCurrent) sel.value = f.ext === 'markdown' ? 'md' : f.ext;
+  }
+
+  function buildApiBox(container){
+    var tpl = $('#apiBoxTemplate');
+    container.innerHTML = '';
+    var node = tpl.content.cloneNode(true);
+    container.appendChild(node);
+    var box = container.querySelector('.api-box');
+    var enterKey = box.querySelector('.enter-key');
+    var keyWrap = box.querySelector('.key-wrap');
+    var providerSel = box.querySelector('.provider');
+    var modelInput = box.querySelector('.model');
+    enterKey.addEventListener('change', function(){
+      keyWrap.style.display = enterKey.checked ? 'block' : 'none';
+    });
+    function updateModelPlaceholder(){
+      modelInput.placeholder = providerSel.value === 'claude' ? 'e.g. claude-sonnet-5' : 'e.g. gemini-3.5-flash-lite';
+    }
+    providerSel.addEventListener('change', updateModelPlaceholder);
+    updateModelPlaceholder();
+    return box;
+  }
+
+  function readApiBox(box){
+    return {
+      provider: box.querySelector('.provider').value,
+      api_key: box.querySelector('.enter-key').checked ? box.querySelector('.api-key').value.trim() : '',
+      model: box.querySelector('.model').value.trim()
+    };
+  }
+
+  var aiSplitBox = null, aiTocBox = null;
+
+  function renderControls(){
+    var op = state.op;
+    $('#controlsTitle').textContent = TITLES[op][0];
+    $('#controlsHint').textContent = TITLES[op][1];
+    $all('.ctrl-block').forEach(function(b){ b.classList.remove('active'); });
+    $('#ctrl-' + op).classList.add('active');
+
+    if (op === 'convert') {
+      var hasAzw3 = state.files.some(function(f){ return f.ext === 'azw3'; });
+      populateFormatSelect($('#convertTarget'), false);
+      $all('#convertTarget option').forEach(function(option){
+        option.disabled = hasAzw3 && option.value !== 'epub';
+      });
+      if (hasAzw3) $('#convertTarget').value = 'epub';
+    }
+    if (op === 'split') {
+      var meta = (state.files[0] && state.files[0].meta) || {};
+      var kindLabel = meta.unit_kind === 'page' ? 'Pages' : (meta.unit_kind === 'chapter' ? 'Chapters' : 'Sections');
+      $('#splitUnitLabel').textContent = kindLabel + ' \u2014 ' + unitLabel(meta);
+      populateFormatSelect($('#splitTarget'), true);
+    }
+    if (op === 'ai-split') {
+      populateFormatSelect($('#aiSplitTarget'), true);
+      aiSplitBox = buildApiBox($('#apiBoxSplit'));
+    }
+    if (op === 'ai-toc') {
+      aiTocBox = buildApiBox($('#apiBoxToc'));
+    }
+  }
+
+  $all('input[name=splitMode]').forEach(function(r){
+    r.addEventListener('change', function(){
+      $('#everyNWrap').style.display = (r.value === 'everyn' && r.checked) ? 'block' : 'none';
+      $('#customWrap').style.display = (r.value === 'custom' && r.checked) ? 'block' : 'none';
+    });
+  });
+
+  function computeSplitSpec(){
+    var mode = $all('input[name=splitMode]').filter(function(r){ return r.checked; })[0].value;
+    var total = (state.files[0] && state.files[0].meta ? state.files[0].meta.units : 0) || 0;
+    if (mode === 'each') {
+      var arr = [];
+      for (var i=1;i<=total;i++) arr.push(i);
+      return arr.join(',');
+    }
+    if (mode === 'everyn') {
+      var n = parseInt($('#everyN').value, 10) || 1;
+      var parts = [];
+      for (var s=1; s<=total; s+=n) {
+        var e = Math.min(s+n-1, total);
+        parts.push(s===e ? (''+s) : (s+'-'+e));
+      }
+      return parts.join(',');
+    }
+    return $('#customRanges').value.trim();
+  }
+
+  // ---- Results rendering -------------------------------------------------
+  function addResults(items){
+    items.forEach(function(it){ state.outputs.push(it); });
+    renderResultsGrid();
+    unlockTab('results');
+  }
+
+  function renderResultsGrid(){
+    var grid = $('#resultsGrid');
+    if (state.outputs.length === 0) {
+      grid.innerHTML = '<div class="empty-note">Nothing produced yet.</div>';
+      $('#downloadAllBtn').disabled = true;
+      return;
+    }
+    grid.innerHTML = '';
+    state.outputs.forEach(function(it){
+      var row = document.createElement('div');
+      row.className = 'ticket';
+      var left = document.createElement('div');
+      left.innerHTML = '<div class="fname">' + escapeHtml(it.filename) + '</div>' +
+        (it.title ? '<div class="title">' + escapeHtml(it.title) + '</div>' : '');
+      var a = document.createElement('a');
+      a.className = 'dl';
+      a.href = '/api/download/output/' + it.output_id;
+      a.textContent = 'Download';
+      row.appendChild(left);
+      row.appendChild(a);
+      grid.appendChild(row);
+    });
+    $('#downloadAllBtn').disabled = false;
+  }
+
+  function escapeHtml(s){
+    var d = document.createElement('div');
+    d.textContent = s;
+    return d.innerHTML;
+  }
+
+  $('#downloadAllBtn').addEventListener('click', function(){
+    var ids = state.outputs.map(function(o){ return o.output_id; });
+    fetch('/api/download-all', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ output_ids: ids })
+    }).then(function(r){
+      if (!r.ok) return r.json().then(function(j){ throw new Error(j.error || 'Download failed'); });
+      return r.blob();
+    }).then(function(blob){
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a');
+      a.href = url; a.download = 'documents.zip';
+      document.body.appendChild(a); a.click(); a.remove();
+      URL.revokeObjectURL(url);
+    }).catch(function(e){ alert(e.message || e); });
+  });
+
+  // ---- Action buttons -----------------------------------------------------
+
+  // Convert: batch endpoint, sends every uploaded file_id.
+  $('#runConvertBtn').addEventListener('click', function(){
+    var btn = this, statusEl = $('#convertStatus');
+    var ids = state.files.map(function(f){ return f.file_id; });
+    if (!ids.length) { setStatus(statusEl, 'No files uploaded.', 'err'); return; }
+    btn.disabled = true;
+    setStatus(statusEl, 'Converting ' + ids.length + ' file(s)\u2026', 'busy');
+    fetch('/api/convert-batch', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ file_ids: ids, target_format: $('#convertTarget').value })
+    }).then(function(r){ return r.json().then(function(j){ return {ok:r.ok, body:j}; }); })
+      .then(function(res){
+        btn.disabled = false;
+        if (!res.ok) { setStatus(statusEl, res.body.error, 'err'); return; }
+        var outs = res.body.outputs || [];
+        var errs = res.body.errors || [];
+        var msg = outs.length + ' file(s) converted.';
+        if (errs.length) {
+          msg += ' ' + errs.length + ' failed: ' + errs.map(function(e){
+            return (e.filename || e.file_id) + ' (' + e.error + ')';
+          }).join('; ');
+          setStatus(statusEl, msg, 'err');
+        } else {
+          setStatus(statusEl, msg, 'ok');
+        }
+        if (outs.length) {
+          addResults(outs);
+          activateTab('results');
+        }
+      }).catch(function(e){ btn.disabled=false; setStatus(statusEl, ''+e, 'err'); });
+  });
+
+  $('#runSplitBtn').addEventListener('click', function(){
+    var btn = this, statusEl = $('#splitStatus');
+    if (!state.files.length) { setStatus(statusEl, 'No file uploaded.', 'err'); return; }
+    var spec;
+    try { spec = computeSplitSpec(); } catch(e){ setStatus(statusEl, 'Invalid range.', 'err'); return; }
+    if (!spec) { setStatus(statusEl, 'Please provide a range.', 'err'); return; }
+    btn.disabled = true;
+    setStatus(statusEl, 'Splitting\u2026', 'busy');
+    fetch('/api/split', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ file_id: state.files[0].file_id, spec: spec, target_format: $('#splitTarget').value })
+    }).then(function(r){ return r.json().then(function(j){ return {ok:r.ok, body:j}; }); })
+      .then(function(res){
+        btn.disabled = false;
+        if (!res.ok) { setStatus(statusEl, res.body.error, 'err'); return; }
+        setStatus(statusEl, res.body.parts.length + ' file(s) created.', 'ok');
+        addResults(res.body.parts);
+        activateTab('results');
+      }).catch(function(e){ btn.disabled=false; setStatus(statusEl, ''+e, 'err'); });
+  });
+
+  // ---- AI split (async, with polling) -----------------------------------
+  var aiSplitPollTimer = null;
+
+  function showAiSplitProgress(show){
+    $('#aiSplitProgressWrap').style.display = show ? 'block' : 'none';
+    if (!show) $('#aiSplitProgressBar').style.width = '0%';
+  }
+
+  function pollAiSplit(jobId, statusEl, btn){
+    fetch('/api/jobs/' + jobId)
+      .then(function(r){ return r.json().then(function(j){ return {ok:r.ok, body:j}; }); })
+      .then(function(res){
+        if (!res.ok) {
+          btn.disabled = false;
+          showAiSplitProgress(false);
+          setStatus(statusEl, res.body.error || 'Job not found.', 'err');
+          return;
+        }
+        var job = res.body;
+        if (job.status === 'error') {
+          btn.disabled = false;
+          showAiSplitProgress(false);
+          setStatus(statusEl, job.error || 'Smart split failed.', 'err');
+          return;
+        }
+        if (job.status === 'done') {
+          btn.disabled = false;
+          showAiSplitProgress(false);
+          var chapters = job.chapters || [];
+          setStatus(statusEl, chapters.length + ' chapter(s) created.' +
+            (job.truncated_outline ? ' (outline sampled for a very long document)' : ''),
+            'ok');
+          if (chapters.length) {
+            addResults(chapters);
+            activateTab('results');
+          }
+          return;
+        }
+        // still running
+        var pct = Math.max(0, Math.min(100, job.pct || 0));
+        $('#aiSplitProgressBar').style.width = pct + '%';
+        setStatus(statusEl, 'Working\u2026', 'busy', (job.phase || 'running') + ' \u00b7 ' + pct + '%');
+        aiSplitPollTimer = setTimeout(function(){ pollAiSplit(jobId, statusEl, btn); }, 1200);
+      })
+      .catch(function(e){
+        btn.disabled = false;
+        showAiSplitProgress(false);
+        setStatus(statusEl, 'Polling failed: ' + e, 'err');
+      });
+  }
+
+  $('#runAiSplitBtn').addEventListener('click', function(){
+    var btn = this, statusEl = $('#aiSplitStatus');
+    if (!state.files.length) { setStatus(statusEl, 'No file uploaded.', 'err'); return; }
+    if (aiSplitPollTimer) { clearTimeout(aiSplitPollTimer); aiSplitPollTimer = null; }
+    var api = readApiBox(aiSplitBox);
+    btn.disabled = true;
+    showAiSplitProgress(true);
+    setStatus(statusEl, 'Starting\u2026', 'busy', 'queued \u00b7 0%');
+    fetch('/api/ai/split/start', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({
+        file_id: state.files[0].file_id, provider: api.provider, api_key: api.api_key,
+        model: api.model, target_format: $('#aiSplitTarget').value
+      })
+    }).then(function(r){ return r.json().then(function(j){ return {ok:r.ok, body:j}; }); })
+      .then(function(res){
+        if (!res.ok) {
+          btn.disabled = false;
+          showAiSplitProgress(false);
+          setStatus(statusEl, res.body.error || 'Could not start job.', 'err');
+          return;
+        }
+        pollAiSplit(res.body.job_id, statusEl, btn);
+      }).catch(function(e){
+        btn.disabled = false;
+        showAiSplitProgress(false);
+        setStatus(statusEl, 'Could not start job: ' + e, 'err');
+      });
+  });
+
+  $('#runAiTocBtn').addEventListener('click', function(){
+    var btn = this, statusEl = $('#aiTocStatus');
+    if (!state.files.length) { setStatus(statusEl, 'No file uploaded.', 'err'); return; }
+    var api = readApiBox(aiTocBox);
+    btn.disabled = true;
+    setStatus(statusEl, 'Asking ' + api.provider + ' to draft a table of contents\u2026', 'busy');
+    fetch('/api/ai/toc', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({
+        file_id: state.files[0].file_id, provider: api.provider, api_key: api.api_key,
+        model: api.model, depth: $('#tocDepth').value
+      })
+    }).then(function(r){ return r.json().then(function(j){ return {ok:r.ok, body:j}; }); })
+      .then(function(res){
+        btn.disabled = false;
+        if (!res.ok) { setStatus(statusEl, res.body.error, 'err'); return; }
+        setStatus(statusEl, 'Done.' + (res.body.truncated ? ' (document truncated for length)' : ''), 'ok');
+        $('#tocPreviewWrap').style.display = 'block';
+        $('#tocPreview').value = res.body.toc_text;
+        addResults([{ output_id: res.body.output_id, filename: res.body.filename }]);
+        activateTab('results');
+      }).catch(function(e){ btn.disabled=false; setStatus(statusEl, ''+e, 'err'); });
+  });
+
+  $('#copyTocBtn').addEventListener('click', function(){
+    var ta = $('#tocPreview');
+    ta.select();
+    navigator.clipboard && navigator.clipboard.writeText(ta.value).catch(function(){ document.execCommand('copy'); });
+  });
+
+})();
+</script>
+</body>
+</html>
